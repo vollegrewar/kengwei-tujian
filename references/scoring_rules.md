@@ -23,13 +23,13 @@
 | H-01 | 城市不可接受 | `job.city` 不在 `profile.all_acceptable_cities()` 中 | 画像: 可接受城市 + 当前城市 | 迁移假定城市 conf=0.4 (REVIEW), 抓取所得 conf=1.0 |
 | H-02 | 行业被拒绝 | `company.industry` 命中 `profile.reject_industries` | 画像: 拒绝行业列表 | 命中即 conf=1.0 |
 | H-03 | 公司规模过小 | `company.scale_max` < `profile.reject_scale_below` (默认 20 人) | 画像: 拒绝规模下限 | 命中即 conf=1.0 |
-| H-04 | 薪资低于硬性下限 | `job.salary.min_10k` < `profile.hard_min_salary_10k` (默认 30 万) | 画像: 硬性最低年薪 | 面议/未知 conf=0.0, 命中 conf=1.0 |
+| H-04 | 薪资低于硬性下限 | `job.salary.max_10k` < `profile.hard_min_salary_10k` → fatal; 仅下限低于底线而上限可达 → REVIEW | 画像: 硬性最低年薪 | 面议/未知 conf=0.0; 上限不足 conf=1.0; 下限不足但上限可达 conf=0.5 |
 | H-05 | 出差强度超标 | JD 信号 `travel==long_term` 且 `profile.accept_travel=False` | 画像: 是否接受出差 + JD 信号 | 置信度来自信号推断 |
 | H-06 | 加班强度超标 | JD 信号 `overtime==heavy` (996/大小周/单休) | 画像隐式 + JD 信号 | 置信度来自信号推断 |
 | H-07 | 命中排除关键词 | JD 文本命中 `profile.blacklist_keywords` | 画像: 黑名单关键词 | 命中即 conf=1.0 |
 | H-08 | 外包/驻场岗位 | JD 信号 `outsourcing==True` 且 `profile.accept_outsourcing=False` | 画像: 是否接受外包 + JD 信号 | 置信度来自信号推断 |
 | H-09 | 学历硬性不符 | 岗位 `edu.rank` < 本人 `profile.education_rank()` (rank 越小要求越高: 1=博士 2=硕士 3=本科 4=大专) | 画像: 最高学历 | 画像未填 conf=0.4 (REVIEW); 命中 conf=1.0 |
-| H-10 | 经验年限硬性不符 | 岗位 `exp.min_years` > 本人 `total_years + 1` → fatal; 1 年以内差距 → REVIEW | 画像: 工作总年限 | 画像未填 conf=0.4; 超出 1 年以上 conf=1.0; 1 年内 conf=0.5 |
+| H-10 | 经验年限硬性不符 | 岗位 `exp.min_years` > 本人 `total_years + 1.5` → fatal; 1.5 年以内差距 → REVIEW | 画像: 工作总年限 | 画像未填 conf=0.4; 超出 1.5 年以上 conf=1.0; 1.5 年内 conf=0.5 |
 | H-11 | 猎头/代招帖 | 招聘者含「猎头」/ 金牌猎头 / 代招标志 (`proxyJob`,`proxyType`) / 匿名雇主; 闸门 `profile.accept_outsourcing=False` | BOSS 列表 API 结构化字段 (无画像阈值, 复用「是否接受外包」) | 招聘者含猎头、金牌猎头 conf=1.0 (fatal); 代招 conf=0.6 (fatal); 匿名雇主 conf=0.5 (REVIEW) |
 
 **置信度机制**:

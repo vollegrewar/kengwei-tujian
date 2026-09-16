@@ -38,7 +38,7 @@ from .scoring_config import ScoringOverrides, load_overrides
 
 log = get_logger("scoring")
 
-RULES_VERSION = "4.1"
+RULES_VERSION = "4.2"
 
 #: 硬性淘汰所需的最低证据置信度 (代码默认值, 可被 scoring_config.json 覆盖)。
 REJECT_CONFIDENCE_FLOOR = 0.6
@@ -341,8 +341,12 @@ def run_hard_checks(job: Job, company: Company, profile: Profile, overrides: Sco
     checks.append(h3)
 
     # H-04 薪资不达标
+    # 判据 (2026-09-16 用户拍板修正): 只有「薪资上限也够不到硬性底线」才致命淘汰。
+    # 下限只是谈判起点 —— 旧判据用 min_10k < floor 直接枪毙, 实测误杀 90 条
+    # (如 10-15K 的岗位, offer 完全可能落到底线以上)。下限低于底线降级为 REVIEW。
     h4 = HardCheck("H-04", "薪资低于硬性下限", floor=floor)
     smin = job.salary.get("min_10k")
+    smax = job.salary.get("max_10k")
     hard_min = profile.hard_min_salary_10k
     if smin is None:
         if job.salary.get("negotiable"):
@@ -350,13 +354,24 @@ def run_hard_checks(job: Job, company: Company, profile: Profile, overrides: Sco
         else:
             h4.reason = "薪资未知, 无法判断"
         h4.confidence = 0.0
-    elif smin < hard_min:
-        h4.hit = True
-        h4.reason = (
-            f"年薪下限 {smin} 万 < 硬性底线 {hard_min} 万 "
-            f"(原文 {job.salary.get('raw', '')})"
-        )
-        h4.evidence.append(job.salary.get("raw", ""))
+    else:
+        ceiling = smax if smax is not None else smin
+        if ceiling < hard_min:
+            h4.hit = True
+            h4.confidence = 1.0
+            h4.reason = (
+                f"年薪上限 {ceiling} 万 < 硬性底线 {hard_min} 万 "
+                f"(原文 {job.salary.get('raw', '')})"
+            )
+            h4.evidence.append(job.salary.get("raw", ""))
+        elif smin < hard_min:
+            h4.hit = True
+            h4.confidence = 0.5
+            h4.reason = (
+                f"年薪下限 {smin} 万 低于硬性底线 {hard_min} 万, 但上限 {ceiling} 万 可达 "
+                f"(原文 {job.salary.get('raw', '')})"
+            )
+            h4.evidence.append(job.salary.get("raw", ""))
     checks.append(h4)
 
     # H-05 长期驻场出差
@@ -443,7 +458,9 @@ def run_hard_checks(job: Job, company: Company, profile: Profile, overrides: Sco
             h10.evidence.append(f"岗位要求: {min_years} 年")
             h10.evidence.append("画像年限未填")
         else:
-            if min_years > years + 1:
+            # 容忍 1.5 年 (2026-09-16 用户拍板): 市场里「5-10年」岗对 3.5 年候选人
+            # 并非绝对关闭 —— 零容忍判据实测误杀 40 条。
+            if min_years > years + 1.5:
                 h10.hit = True
                 h10.confidence = 1.0
                 h10.reason = f"岗位要求 {min_years} 年, 本人 {years} 年, 超出 {min_years - years:.1f} 年"
@@ -452,7 +469,7 @@ def run_hard_checks(job: Job, company: Company, profile: Profile, overrides: Sco
             elif min_years > years:
                 h10.hit = True
                 h10.confidence = 0.5
-                h10.reason = f"岗位要求 {min_years} 年, 本人 {years} 年, 差距 {min_years - years:.1f} 年 (1年以内可放宽)"
+                h10.reason = f"岗位要求 {min_years} 年, 本人 {years} 年, 差距 {min_years - years:.1f} 年 (1.5 年以内可放宽)"
                 h10.evidence.append(f"岗位要求: {exp.get('raw', '')}")
                 h10.evidence.append(f"本人: {years} 年")
             else:
@@ -1208,13 +1225,13 @@ _CATALOG_STATIC: dict[str, Any] = {
         {"code": "H-01", "label": "城市不可接受", "detail": "职位城市不在画像的可接受城市列表内。迁移时人工假定的城市置信度仅 40%, 命中只标 REVIEW 不淘汰。"},
         {"code": "H-02", "label": "行业被拒绝", "detail": "公司行业命中画像的拒绝行业列表。"},
         {"code": "H-03", "label": "公司规模过小", "detail": "公司规模上限低于画像的拒绝规模下限 (默认 20 人)。"},
-        {"code": "H-04", "label": "薪资低于硬性下限", "detail": "年薪下限 < 画像的硬性最低可接受年薪 (默认期望下限的 85%)。面议/未知不淘汰。"},
+        {"code": "H-04", "label": "薪资低于硬性下限", "detail": "年薪上限 < 画像的硬性最低可接受年薪 (默认期望下限的 85%) 才致命淘汰; 下限低于底线但上限可达 → REVIEW(conf=0.5)。面议/未知不淘汰。"},
         {"code": "H-05", "label": "出差强度超标", "detail": "JD 要求长期驻场/外派, 且画像明确不接受出差。判定逻辑: 命中后取 JD 信号推断置信度, >= floor 直接淘汰, < floor 标 REVIEW 交 AI 核实。"},
         {"code": "H-06", "label": "加班强度超标", "detail": "推断为 996/大小周/单休等高强度作息。判定逻辑: 置信度来自 job.signals['overtime'], >= floor 直接淘汰, < floor 标 REVIEW。"},
         {"code": "H-07", "label": "命中排除关键词", "detail": "JD 文本命中画像的排除关键词黑名单 (如大小周、995、外包驻场)。命中即淘汰, 无置信度衰减。"},
         {"code": "H-08", "label": "外包/驻场岗位", "detail": "推断为外包/劳务派遣/驻场岗位, 且画像不接受外包。判定逻辑: 置信度来自 job.signals['outsourcing'], >= floor 直接淘汰, < floor 标 REVIEW。"},
         {"code": "H-09", "label": "学历硬性不符", "detail": "岗位要求学历高于本人最高学历。判定逻辑: 岗位 edu.rank < 本人 edu.rank 即命中 (1=博士 2=硕士 3=本科 4=大专), 命中即淘汰(无置信度衰减, 学历要求是硬门槛)。画像未填学历时标 REVIEW。"},
-        {"code": "H-10", "label": "经验年限硬性不符", "detail": "岗位要求最低年限超出本人总年限。判定逻辑: 超出 1 年以上直接淘汰, 1 年以内差距标 REVIEW 交 AI 核实。画像未填年限时标 REVIEW。"},
+        {"code": "H-10", "label": "经验年限硬性不符", "detail": "岗位要求最低年限超出本人总年限。判定逻辑: 超出 1.5 年以上直接淘汰, 1.5 年以内差距标 REVIEW 交 AI 核实。画像未填年限时标 REVIEW。"},
         {"code": "H-11", "label": "猎头/代招帖", "detail": "BOSS 列表 API 的结构化标志识别中介渠道帖: 招聘者头衔含「猎头」或平台标记金牌猎头 → conf=1.0 直接淘汰; 代招标志 (proxyJob/proxyType) → 0.6; 匿名雇主 (公司名被替换成「某…公司」) → 0.5 标 REVIEW。闸门复用画像的「接受外包岗位」开关。"},
     ],
     "dimensions": [

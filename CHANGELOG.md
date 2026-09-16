@@ -10,6 +10,22 @@
 
 ***
 
+## \[v0.8.1] — 导入归一化修复与硬规则判据校准（规则 4.2）
+
+**修复**
+
+- **平台导入岗位未走归一化**：`import_jobs._to_ga_job` 只写 `raw` 文本，未解析薪资/经验/学历、未切分 JD、未提信号 → 201 条（占语料 45%）规则四维全部 0 分，其中 137 条误判 REJECTED（含吉利/移远/小米的 AI 测试工程师）。已修导入路径，并新增 `gaj renormalize-imported [--dry-run] [--rescore]` 修存量（201/201 补全，幂等）。**规则分与 AI 分相关系数 −0.17 → +0.64。**
+- **API driver 请求头**：默认带桌面浏览器 UA（Cloudflare 对 urllib 默认 UA 回 `error code: 1010`）；新增 `GAJ_API_EXTRA_HEADERS`（JSON）传自定义头，用于 OpenCode Go 等要求 `x-opencode-session` 的渠道。
+- **`analyze --provider api` 不再要求 Chrome**（API driver 本就不需要，原预检是 bug）。
+
+**规则判据校准（H-04 / H-10）**
+
+- **H-04**：改判「薪资**上限**低于硬性底线」才致命淘汰（原来只看下限）。下限低于底线但上限可达 → REVIEW(conf=0.5)。否决面 **121 → 31 条**。
+- **H-10**：经验超出容忍线从 1 年放宽到 **1.5 年**（`exp_min > total_years + 1.5` 才致命）。否决面 **43 → 3 条**。
+- 合计：REJECTED **217 → 98**，REVIEW **3 → 122**，候选池 225 → **344**（测试/评测类 217）。
+
+**测试**：新增 `tests/test_import_normalize.py`(6)、`tests/test_hard_rule_calibration.py`(17)、`tests/test_api_driver_headers.py`(11)，全套 **145 passed**。
+
 ## \[v0.8.0] — 猎头/代招识别（H-11）与水印清洗补强
 
 > 2026-09-16。列表 API 里早就带着招聘者、金牌猎头、匿名、代招这些结构化字段，
