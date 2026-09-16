@@ -87,6 +87,15 @@ def main(argv: list[str] | None = None) -> int:
     # ---- backfill-geo ----
     sub.add_parser("backfill-geo", help="从 job.json 回填 lat/lng/district 到索引")
 
+    # ---- renormalize-imported (平台导入岗位补归一化字段) ----
+    p = sub.add_parser(
+        "renormalize-imported",
+        help="给猎聘/智联导入岗位补归一化字段(薪资/经验/学历/JD切分/信号)并可选重打分",
+    )
+    p.add_argument("--dry-run", action="store_true", help="只看报告, 不落盘")
+    p.add_argument("--rescore", action="store_true", help="补完对这些岗位重跑规则打分")
+    p.add_argument("--sources", default="liepin,zhaopin", help="逗号分隔的来源 (默认 liepin,zhaopin)")
+
     # ---- backfill-list-item (存量回填列表 API 字段: 招聘者/匿名/代招) ----
     p = sub.add_parser(
         "backfill-list-item",
@@ -294,6 +303,25 @@ def main(argv: list[str] | None = None) -> int:
 
         out = index.backfill_geo()
         print(f"✓ geo 回填: 扫描 {out['scanned']}, 更新 {out['updated']}, {out['seconds']}s")
+        return 0
+
+    if args.command == "renormalize-imported":
+        import json as _json
+
+        from .platforms.import_jobs import renormalize_imported
+
+        srcs = tuple(s.strip() for s in args.sources.split(",") if s.strip())
+        rep = renormalize_imported(dry_run=args.dry_run, sources=srcs, rescore=args.rescore)
+        print(_json.dumps({
+            "ok": True,
+            "scanned": rep["scanned"],
+            "changed": rep["changed"],
+            "rescored": rep["rescored"],
+            "meta_rows": rep.get("meta_rows", 0),
+            "details": rep["details"],
+            "dry_run": args.dry_run,
+            "note": "补齐数值字段后规则四维不再是 0 分; 建议 --rescore 或 `gaj score --all --force`",
+        }, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "backfill-list-item":

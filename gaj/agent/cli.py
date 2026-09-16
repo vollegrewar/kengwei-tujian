@@ -352,10 +352,14 @@ def cmd_analyze(args) -> int:
             exit_code=EXIT_USAGE,
         )
 
-    if not _chrome_ready():
+    from ..browser import needs_chrome
+
+    # api provider 走 HTTP, 不需要浏览器 (此前无条件预检, 导致配了 key 也要求开 Chrome)
+    if needs_chrome(args.provider) and not _chrome_ready():
         return _err(
             "analyze", "chrome_not_ready",
-            "Chrome CDP 未运行。请先执行: python3 -m gaj setup-chrome",
+            "Chrome CDP 未运行。请先执行: python3 -m gaj setup-chrome "
+            "(或改用 --provider api, 无需浏览器)",
         )
 
     if getattr(args, "company", None):
@@ -643,10 +647,15 @@ def cmd_daily(args) -> int:
             exit_code=EXIT_USAGE,
         )
 
-    if not _chrome_ready():
+    from ..browser import needs_chrome
+
+    # 只有「要采集」或「用浏览器版大模型」时才需要 Chrome:
+    # --no-crawl + --provider api 可以完全无浏览器跑存量分析
+    if (not getattr(args, "no_crawl", False) or needs_chrome(args.provider)) and not _chrome_ready():
         return _err(
             "daily", "chrome_not_ready",
-            "Chrome CDP 未运行。请先执行: python3 -m gaj setup-chrome",
+            "Chrome CDP 未运行。请先执行: python3 -m gaj setup-chrome "
+            "(或 --no-crawl --provider api 无浏览器跑)",
         )
 
     warnings: list[str] = []

@@ -4,11 +4,18 @@
 豆包 / Kimi / vLLM / Ollama 等), 不依赖 Chrome CDP 与网页登录态。
 
 环境变量配置 (无则走对应字段默认值):
-    GAJ_API_BASE_URL   API 根地址, 默认 https://api.deepseek.com/v1
-    GAJ_API_KEY         API Key (必填)
-    GAJ_API_MODEL       模型名, 默认 deepseek-chat
-    GAJ_API_TIMEOUT     单次请求超时秒数, 默认 300
-    GAJ_API_MAX_TOKENS  输出上限, 默认 4096
+    GAJ_API_BASE_URL      API 根地址, 默认 https://api.deepseek.com/v1
+    GAJ_API_KEY           API Key (必填)
+    GAJ_API_MODEL         模型名, 默认 deepseek-chat
+    GAJ_API_TIMEOUT       单次请求超时秒数, 默认 300
+    GAJ_API_MAX_TOKENS    输出上限, 默认 4096
+    GAJ_API_USER_AGENT    请求 UA, 默认常见桌面浏览器 UA
+    GAJ_API_EXTRA_HEADERS 额外请求头 (JSON 对象字符串), 如
+                          '{"x-opencode-session": "hermes"}'
+
+UA / 额外头为什么需要: 不少中转与网关前面挂着 Cloudflare —— 对 urllib 默认的
+``Python-urllib/3.x`` 直接回 ``error code: 1010``; 有些渠道还要求自定义路由头
+(OpenCode Go 必须带 ``x-opencode-session``, 否则返回 MissingSessionID)。
 
 使用方式:
     from gaj.browser import get_driver
@@ -27,6 +34,33 @@ import urllib.request
 from ..logging_setup import get_logger
 
 log = get_logger("browser.api")
+
+# 默认 UA: 用常见桌面浏览器 UA, 避免被 Cloudflare 之类的 WAF 按
+# "Python-urllib/3.x" 指纹拦掉 (实测 opencode.ai/zen 对默认 UA 直接 1010)。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _parse_extra_headers(raw: str) -> dict[str, str]:
+    """``GAJ_API_EXTRA_HEADERS`` (JSON 对象) -> 请求头 dict。
+
+    非法输入只告警不抛: 打分流程不该因为一个头配置写错就整体失败。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning(f"GAJ_API_EXTRA_HEADERS 不是合法 JSON, 已忽略: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        log.warning("GAJ_API_EXTRA_HEADERS 必须是 JSON 对象, 已忽略")
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
 
 # 环境变量 -> (字段名, 默认值)
 _ENV_MAP = {
@@ -60,6 +94,10 @@ class APIDriver:
             self.max_tokens = int(os.environ.get("GAJ_API_MAX_TOKENS", "4096"))
         except ValueError:
             self.max_tokens = 4096
+        self.user_agent = os.environ.get("GAJ_API_USER_AGENT", DEFAULT_USER_AGENT)
+        self.extra_headers = _parse_extra_headers(
+            os.environ.get("GAJ_API_EXTRA_HEADERS", "")
+        )
 
         if not self.api_key:
             raise ValueError(
@@ -82,6 +120,8 @@ class APIDriver:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": self.user_agent,
+            **self.extra_headers,
         }
 
         started = time.time()

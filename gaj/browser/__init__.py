@@ -41,6 +41,16 @@ def available_providers() -> list[str]:
     return list(_DRIVERS.keys()) + list(_API_PROVIDERS.keys())
 
 
+def needs_chrome(provider: str) -> bool:
+    """该 provider 是否需要 Chrome CDP 与登录态。
+
+    ``api`` 走 OpenAI 兼容 HTTP, 不需要浏览器 —— 调用方(如 agent CLI 的
+    analyze)在做 Chrome 预检前必须先问这里, 否则会把自己锁死: 明明配了 API
+    key 也得先开浏览器才能打分。
+    """
+    return provider not in _API_PROVIDERS
+
+
 def get_driver(
     provider: str,
     session: CDPSession | None = None,
