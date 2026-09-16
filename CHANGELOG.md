@@ -28,11 +28,18 @@
 
 - **`job.boss` 新增字段**: `anonymous` / `proxy_job` / `proxy_type`（来自列表项）。
 
-- **口径扩池（`gaj scope-urls`）**: 单口径池子会见顶（`resCount` 虚高，实测单口径实得 ≈30 条），
+- **口径扩池（`gaj scope-urls`）**: `resCount` 虚高且不随筛选变化（`AI测试@杭州` 恒报 450），
+  但**深翻页与筛选参数均实测有效**（同口径 page 1/2/3 各 15 条零重叠、去重 45 条仍未触底；
+  `&experience=105` 页面 15/15 命中筛选、与基线仅 3/15 重叠）。
   用「关键词 × 筛选条件」批量生成口径 URL —— 主词跑全量组合（38 条 = 1 基线 + 37 编码），
   其余同族词跑精选组合（17 条）；`--out` 落文件、`--label` 给建议口径名（配合 `scope-link rename`）。
   新增 `gaj/core/scope_urls.py`（码表 + URL 构造 + 反解析/命名）。
   城市码**只收录已验证的 6 城**，其余走 `--city-code` 裸码或 `references/boss_city_codes.json`。
+
+- **存量字段回填（`gaj backfill-list-item`）**: 用 `data/_raw/crawl-*/_debug/joblist_page_*.json`
+  里的列表 API 原始项补历史岗位的招聘者 / 匿名 / 代招字段（零风控成本，只补空不覆盖）。
+  本机实测：265 条职位中 64 条的 `boss` 字段从空补齐，`--rescore` 顺带刷新规则分。
+  新增 `gaj/store/backfill.py`。
 
 - **`gaj export-filter-codes`**: 在已登录页面导出筛选下拉的 `ka` 编码，与内置码表 diff 后写入
   `references/boss_filter_codes.json`（生成器优先读它）—— 编码漂移时不用人肉比对。

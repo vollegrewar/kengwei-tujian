@@ -786,6 +786,24 @@ def cmd_scope_urls(args) -> int:
     })
 
 
+def cmd_backfill_list_item(args) -> int:
+    """用采集目录的列表 API 原始项补历史岗位的招聘者/匿名/代招字段 (零风控成本)。"""
+    from ..store.backfill import run_backfill
+
+    rep = run_backfill(dry_run=args.dry_run, limit_dirs=args.dirs, rescore=args.rescore)
+    return _ok("backfill-list-item", {
+        "pages": rep.pages,
+        "items": rep.items,
+        "scanned_jobs": rep.scanned_jobs,
+        "matched": rep.matched,
+        "updated_ids": rep.updated,
+        "skipped_had_fields": rep.already_had,
+        "dry_run": args.dry_run,
+        "rescored": bool(args.rescore and rep.updated),
+        "report": rep.render(),
+    })
+
+
 _HANDLERS = {
     "status": cmd_status,
     "jobs": cmd_jobs,
@@ -794,6 +812,7 @@ _HANDLERS = {
     "crawl": cmd_crawl,
     "daily": cmd_daily,
     "scope-urls": cmd_scope_urls,
+    "backfill-list-item": cmd_backfill_list_item,
 }
 
 
@@ -854,6 +873,10 @@ def main(argv: list[str] | None = None) -> int:
            --city 杭州 --keywords "AI测试,大模型评测"  (主词 full 38 条 + 其余 selected 17 条)
            --list-cities 列已验证城市码; 未验证城市用 --city-code 传裸码。
            --out 落文件后逐条 crawl (每条 URL 即一个 source_link 口径)。
+
+  backfill-list-item
+           用采集目录的列表 API 原始项补历史岗位的招聘者/匿名/代招字段 (零风控成本,
+           只补空不覆盖)。--dry-run 先看报告, --rescore 顺带刷新规则分 (H-11 生效)。
 
 错误码: usage/chrome_not_ready/not_logged_in/no_crawl_url/job_not_found/
        crawl_failed/ai_failed/timeout/index_error/internal/unknown_city
@@ -924,6 +947,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--analyze-limit", type=int, default=3, help="AI 分析的职位数 (默认 3)")
     p.add_argument("--provider", default="deepseek", help="deepseek/doubao/tongyi/kimi")
     p.add_argument("--deep", action="store_true", help="生成深度分析报告")
+
+    p = sub.add_parser("backfill-list-item",
+                       help="补历史岗位的招聘者/匿名/代招字段 (从采集目录的列表 API 原始项)")
+    p.add_argument("--dry-run", action="store_true", help="只看报告, 不落盘")
+    p.add_argument("--dirs", type=int, default=0, help="只扫最近 N 个 crawl-* 目录 (0=全部)")
+    p.add_argument("--rescore", action="store_true", help="对变更岗位重跑规则打分")
 
     p = sub.add_parser("scope-urls", help="生成口径 URL (关键词 × 筛选条件, 单口径见顶时扩池)")
     p.add_argument("--city", default="", help="城市名 (仅内置已验证城市, 见 --list-cities)")

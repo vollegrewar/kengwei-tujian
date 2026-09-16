@@ -13,6 +13,7 @@
     python3 -m gaj scope-urls --city 杭州 --keywords "AI测试,大模型评测"
                                             # 生成口径 URL (关键词 × 筛选条件扩池)
     python3 -m gaj export-filter-codes      # 从已登录页面刷新筛选编码表
+    python3 -m gaj backfill-list-item       # 用采集目录的列表项补历史岗位的招聘者字段
     python3 -m gaj agent <command> ...      # 面向 AI 智能体的 JSON 接口
 """
 
@@ -85,6 +86,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- backfill-geo ----
     sub.add_parser("backfill-geo", help="从 job.json 回填 lat/lng/district 到索引")
+
+    # ---- backfill-list-item (存量回填列表 API 字段: 招聘者/匿名/代招) ----
+    p = sub.add_parser(
+        "backfill-list-item",
+        help="用采集目录的列表 API 原始项补历史岗位的招聘者/匿名/代招字段",
+    )
+    p.add_argument("--raw-dir", default=None, help="采集目录根 (默认 data/_raw)")
+    p.add_argument("--dirs", type=int, default=0, help="只扫最近 N 个 crawl-* 目录 (0=全部)")
+    p.add_argument("--dry-run", action="store_true", help="只看报告, 不落盘")
+    p.add_argument("--rescore", action="store_true", help="对变更岗位重跑规则打分 (H-11 需要)")
+    p.add_argument("--pretty", action="store_true", help="JSON 缩进输出")
 
     # ---- fix-conflicts ----
     p = sub.add_parser("fix-conflicts", help="自动修复 brand_id 串号遗留的脏数据")
@@ -282,6 +294,33 @@ def main(argv: list[str] | None = None) -> int:
 
         out = index.backfill_geo()
         print(f"✓ geo 回填: 扫描 {out['scanned']}, 更新 {out['updated']}, {out['seconds']}s")
+        return 0
+
+    if args.command == "backfill-list-item":
+        import json as _json
+        from pathlib import Path as _Path
+
+        from .store.backfill import run_backfill
+
+        rep = run_backfill(
+            raw_dir=_Path(args.raw_dir) if args.raw_dir else None,
+            dry_run=args.dry_run,
+            limit_dirs=args.dirs,
+            rescore=args.rescore,
+        )
+        print(rep.render())
+        print(_json.dumps({
+            "ok": True,
+            "pages": rep.pages,
+            "items": rep.items,
+            "scanned_jobs": rep.scanned_jobs,
+            "matched": rep.matched,
+            "updated": rep.updated,
+            "skipped_had_fields": rep.already_had,
+            "dry_run": args.dry_run,
+            "rescored": bool(args.rescore and rep.updated),
+            "hint": "补完如出现猎头/代招命中, 用 --rescore 或 `gaj score --all --force` 刷新规则分",
+        }, ensure_ascii=False, indent=2 if getattr(args, "pretty", False) else None))
         return 0
 
     if args.command == "fix-conflicts":

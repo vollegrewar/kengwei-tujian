@@ -192,8 +192,13 @@ gaj-reporter 可用指定数据包复显历史报告：`--source bundle --bundle
 
 - 采集节奏模拟人工浏览，不要为提速改动节奏逻辑或并发多开 crawl。
 
-- **单口径池子会见顶**（同一筛选链接约 30 条后全是重复）：要更多岗位不要靠加
-  `--max-pages`，而是**换筛选条件**——`python3 -m gaj scope-urls --city <城市>
+- **老岗位缺招聘者/匿名/代招字段**（`job.boss` 为空）：这些字段只在「新采到」时落盘，
+  被跳过的重复岗位补不到。用 `python3 -m gaj backfill-list-item`（或 `gaj agent
+  backfill-list-item --dry-run`）从采集目录的原始列表响应里反查补齐 —— 零风控成本，
+  只补空不覆盖；有变更时加 `--rescore` 让 H-11 生效。
+
+- **要更多岗位先深翻页**（同一口径连翻即可，实测 3 页零重叠；`resCount` 是虚高数字别信），
+  **不够再换筛选条件**——`python3 -m gaj scope-urls --city <城市>
   --keywords "<主词,同族词...>" --out <文件>` 生成一组口径 URL（每条 URL 一个口径，
   快照/报告隔离自动生效），再逐条 `crawl`。别一次全跑：多口径采集有风控成本，
   建议只跑与画像相关的那几组 + 每条之间留间隔。编码漂移时先
