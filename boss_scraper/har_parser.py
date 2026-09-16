@@ -14,6 +14,7 @@ from typing import Optional
 from urllib.parse import unquote, parse_qs
 
 from .logger import get_logger
+from .network import DEFAULT_PAGE_SIZE
 
 log = get_logger("har")
 
@@ -270,7 +271,7 @@ def extract_search_params_from_url(url: str) -> dict:
 
     # 固定参数
     params["scene"] = "1"
-    params["pageSize"] = "15"
+    params["pageSize"] = DEFAULT_PAGE_SIZE
 
     # 空参数 (API 要求)
     for key in [

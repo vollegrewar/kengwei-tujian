@@ -26,6 +26,11 @@ log = get_logger("network")
 # BOSS直聘职位列表 API 端点
 JOBLIST_API_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 
+# 单页条数。API 接受 30 且确实按 20~30 条返回（2026-09-16 实测：同参数下
+# job-pipeline 用 pageSize=30 六个请求拿到 120 条 ≈20 条/页，若被压回 15 条
+# 上限则最多 90 条）—— 比 15 条/页少一半请求，采集同等页数时风控暴露更小。
+DEFAULT_PAGE_SIZE = "30"
+
 # 翻页延迟范围 (秒)
 DELAY_MIN = 3
 DELAY_MAX = 8
@@ -56,7 +61,7 @@ def build_fetch_js(page: int, params: dict) -> str:
     # 构建参数对象
     js_params = {}
     js_params["page"] = str(page)
-    js_params["pageSize"] = params.get("pageSize", "15")
+    js_params["pageSize"] = params.get("pageSize", DEFAULT_PAGE_SIZE)
     js_params["city"] = params.get("city", "")
     js_params["position"] = params.get("position", "")
     js_params["salary"] = params.get("salary", "")

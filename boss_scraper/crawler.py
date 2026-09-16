@@ -33,6 +33,7 @@ from .har_parser import (
     HARAnalysisResult,
 )
 from .network import (
+    DEFAULT_PAGE_SIZE,
     fetch_job_list_with_retry,
     extract_job_items,
     build_job_detail_url,
@@ -601,7 +602,7 @@ class JobCrawler:
         """
         params = dict(har_result.request_params)
         # 确保必要参数存在
-        params.setdefault("pageSize", "15")
+        params.setdefault("pageSize", DEFAULT_PAGE_SIZE)
         params.setdefault("scene", "1")
         return params
 
