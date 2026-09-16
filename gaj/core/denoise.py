@@ -7,7 +7,16 @@
        "后端开发来自BOSS直聘经验"  ->  "后端开发经验"
        "计直聘算机相关专业"        ->  "计算机相关专业"
        "岗位职直聘责：1、"          ->  "岗位职责：1、"
-   插入的永远是 "来自BOSS直聘" 这个串的前缀/子串, 所以按长度倒序剥离即可。
+   最常插入的是 "来自BOSS直聘" 这个串的前缀/子串, 所以按长度倒序剥离即可。
+
+   除此之外还有两类纯拉丁字母碎片, 中文词表覆盖不到, 单独处理:
+       "负责制定kanzhun和执行产品"  ->  "负责制定和执行产品"
+       "岗位职boss责"              ->  "岗位职责"
+   pass 1: kanzhun 是看准网的拼音 (BOSS 的关联品牌), 在中文 JD 里没有任何
+           合法用法, 一律剥离。
+   pass 2: boss / zhipin 这类英文碎片只在**两侧都是汉字**时才判定为水印 ——
+           正文里合法的英文串 (Python / LLM / Agent / Boss 系统) 不会夹在两个
+           汉字中间, 而水印的插入点必然如此。
 
 2. 康熙部首替身字 (U+2F00 区段)
    "⼯程" 里的 ⼯ 是 U+2F27 KANGXI RADICAL WORK, 不是 U+5DE5 的 工。
@@ -40,6 +49,14 @@ WATERMARK_TOKENS: tuple[str, ...] = (
 )
 
 _WATERMARK_RE = re.compile("|".join(re.escape(t) for t in WATERMARK_TOKENS))
+
+# 纯拉丁字母水印碎片 #1: 看准网拼音, 中文 JD 里无合法用法, 一律剥离
+_LATIN_BRAND_RE = re.compile(r"kanzhun", re.IGNORECASE)
+
+# 纯拉丁字母水印碎片 #2: 只在两侧都是汉字时才算水印 (见模块 docstring)
+_SANDWICH_LATIN_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff])(?:boss|zhipin|kanzhun)(?=[\u4e00-\u9fff])", re.IGNORECASE
+)
 
 # 零宽字符 / 软连字符 —— 另一种常见的分词干扰手段
 _INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff\u00ad]")
@@ -84,7 +101,9 @@ def strip_watermark(text: str) -> tuple[str, int]:
         count += 1
         return ""
 
-    return _WATERMARK_RE.sub(_sub, text), count
+    text = _WATERMARK_RE.sub(_sub, text)
+    text = _LATIN_BRAND_RE.sub(_sub, text)
+    return _SANDWICH_LATIN_RE.sub(_sub, text), count
 
 
 def normalize_whitespace(text: str) -> str:
@@ -140,6 +159,8 @@ def looks_polluted(text: str) -> bool:
     if not text:
         return False
     if _WATERMARK_RE.search(text):
+        return True
+    if _LATIN_BRAND_RE.search(text) or _SANDWICH_LATIN_RE.search(text):
         return True
     return any(_is_compat_char(ch) for ch in text)
 

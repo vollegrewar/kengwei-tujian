@@ -720,6 +720,72 @@ def cmd_daily(args) -> int:
 # ---------------------------------------------------------------- 入口
 
 
+def cmd_scope_urls(args) -> int:
+    """生成口径 URL（关键词 × 筛选条件），供智能体在单口径见顶时扩池。"""
+    from ..core import scope_urls as su
+
+    if getattr(args, "list_cities", False):
+        return _ok("scope-urls", {
+            "cities": su.load_city_codes(),
+            "source": su.CITY_CODES_SOURCE,
+            "note": "未列入的城市用 --city-code 传裸码 (从页面 URL 的 city= 读), 不要猜",
+        })
+
+    if not args.keywords:
+        return _err("scope-urls", "usage", "需要 --keywords 或 --list-cities",
+                    exit_code=EXIT_USAGE)
+    kws = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    city = args.city or args.city_code or ""
+    if not city:
+        return _err("scope-urls", "usage", "需要 --city 或 --city-code", exit_code=EXIT_USAGE)
+
+    try:
+        if args.city_code:
+            city_code = args.city_code
+        else:
+            city_code = su.resolve_city_code(city)
+            if not city_code:
+                return _err(
+                    "scope-urls", "unknown_city",
+                    f"未知城市 {city!r}: 内置只收录已验证城市 {sorted(su.load_city_codes())}, "
+                    "请用 --city-code 传裸码",
+                    exit_code=EXIT_USAGE,
+                )
+        if args.mode == "auto":
+            items = su.build_scope_urls(city, kws)
+            note = "主词 full + 其余 selected"
+        else:
+            items, seen = [], set()
+            for item in su.build_urls(kws[0], city_code, args.mode):
+                if item["url"] not in seen:
+                    seen.add(item["url"])
+                    items.append(item)
+            note = f"全部关键词用 {args.mode}"
+    except ValueError as exc:
+        return _err("scope-urls", "usage", str(exc), exit_code=EXIT_USAGE)
+
+    if args.out:
+        from pathlib import Path
+
+        Path(args.out).write_text("\n".join(it["url"] for it in items) + "\n",
+                                  encoding="utf-8")
+
+    return _ok("scope-urls", {
+        "city": city,
+        "city_code": city_code,
+        "keywords": kws,
+        "mode": args.mode,
+        "mode_note": note,
+        "url_count": len(items),
+        "urls": items,
+        "out": args.out or "",
+        "next_steps": [
+            "逐条采集: gaj crawl \"<url>\" (每条 URL 即一个 source_link 口径)",
+            "只跑与画像相关的口径组合, 多条之间留间隔 (有风控成本)",
+        ],
+    })
+
+
 _HANDLERS = {
     "status": cmd_status,
     "jobs": cmd_jobs,
@@ -727,6 +793,7 @@ _HANDLERS = {
     "analyze": cmd_analyze,
     "crawl": cmd_crawl,
     "daily": cmd_daily,
+    "scope-urls": cmd_scope_urls,
 }
 
 
@@ -781,8 +848,15 @@ def main(argv: list[str] | None = None) -> int:
            返回 crawl(含 new_job_ids)/analyzed[]/analyzed_success/
            warnings/digest_markdown。
 
+  scope-urls 生成口径 URL (关键词 × 筛选条件)。单口径池子会见顶(同一筛选链接
+           约 30 条后全是重复, resCount 是虚高数字), 要更多岗位靠换筛选条件。
+           返回 url_count + urls[{url, keyword, dimension, code, label}]。
+           --city 杭州 --keywords "AI测试,大模型评测"  (主词 full 38 条 + 其余 selected 17 条)
+           --list-cities 列已验证城市码; 未验证城市用 --city-code 传裸码。
+           --out 落文件后逐条 crawl (每条 URL 即一个 source_link 口径)。
+
 错误码: usage/chrome_not_ready/not_logged_in/no_crawl_url/job_not_found/
-       crawl_failed/ai_failed/timeout/index_error/internal
+       crawl_failed/ai_failed/timeout/index_error/internal/unknown_city
 退出码: 0=成功 1=失败 2=参数错误
 超时预算: status/jobs/job 30s, crawl 最坏 30min, daily 建议 45min
 """,
@@ -850,6 +924,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--analyze-limit", type=int, default=3, help="AI 分析的职位数 (默认 3)")
     p.add_argument("--provider", default="deepseek", help="deepseek/doubao/tongyi/kimi")
     p.add_argument("--deep", action="store_true", help="生成深度分析报告")
+
+    p = sub.add_parser("scope-urls", help="生成口径 URL (关键词 × 筛选条件, 单口径见顶时扩池)")
+    p.add_argument("--city", default="", help="城市名 (仅内置已验证城市, 见 --list-cities)")
+    p.add_argument("--city-code", default="", help="BOSS city 码 (内置表没有的城市传裸码)")
+    p.add_argument("--keywords", default="", help="逗号分隔关键词; 主词 full, 其余 selected")
+    p.add_argument("--mode", default="auto", choices=["auto", "full", "selected", "baseline"])
+    p.add_argument("--out", default="", help="把 URL 逐行写进文件")
+    p.add_argument("--list-cities", action="store_true", help="只列内置城市码")
 
     try:
         args = ap.parse_args(argv)

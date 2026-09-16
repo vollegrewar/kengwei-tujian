@@ -38,7 +38,7 @@ from .scoring_config import ScoringOverrides, load_overrides
 
 log = get_logger("scoring")
 
-RULES_VERSION = "4.0"
+RULES_VERSION = "4.1"
 
 #: 硬性淘汰所需的最低证据置信度 (代码默认值, 可被 scoring_config.json 覆盖)。
 REJECT_CONFIDENCE_FLOOR = 0.6
@@ -259,6 +259,44 @@ def _sig_evidence(job: Job, name: str) -> list[str]:
     return list(ev) if isinstance(ev, list) else []
 
 
+# ---------------------------------------------------------------- 猎头 / 代招
+
+
+def headhunter_evidence(job: Job) -> tuple[list[str], float]:
+    """识别猎头 / 代招帖, 返回 (证据列表, 置信度)。
+
+    只用 BOSS 列表 API 的结构化字段 (详情页 DOM 里没有招聘者信息), 两档证据:
+
+    - **平台自报** (招聘者头衔含「猎头」/ 金牌猎头标志) → 1.0, 可直接淘汰
+    - **渠道线索** (代招标志 / 匿名雇主) → 0.5~0.6, 低于阈值只标 REVIEW 交 AI
+
+    反面教训: 不要拿「人力 / 人才 / 人力资源」去扫公司名或职位名 —— 正常公司
+    的 HR 发帖 (「红杉中国/徐女士·人力资源HR」) 公司名里就带这些字, 实测这类
+    宽正则的命中全是误报。
+    """
+    boss = job.boss or {}
+    recruiter = " ".join(str(boss.get(k) or "").strip() for k in ("name", "title")).strip()
+    evidence: list[str] = []
+    confidence = 0.0
+
+    if "猎头" in recruiter:
+        evidence.append(f"招聘者: {recruiter}")
+        confidence = 1.0
+    if boss.get("gold_hunter"):
+        evidence.append("平台标记: 金牌猎头")
+        confidence = max(confidence, 1.0)
+    if boss.get("proxy_job") or boss.get("proxy_type"):
+        evidence.append(
+            f"平台标记: 代招 (proxyJob={boss.get('proxy_job')}, "
+            f"proxyType={boss.get('proxy_type')})"
+        )
+        confidence = max(confidence, 0.6)
+    if boss.get("anonymous") or job.provenance.get("employer_anonymous"):
+        evidence.append("匿名雇主: 公司名被替换成「某…公司」")
+        confidence = max(confidence, 0.5)
+    return evidence, confidence
+
+
 # ---------------------------------------------------------------- 硬性淘汰
 
 
@@ -420,6 +458,17 @@ def run_hard_checks(job: Job, company: Company, profile: Profile, overrides: Sco
             else:
                 h10.reason = f"岗位要求 {min_years} 年, 本人 {years} 年, 兼容"
     checks.append(h10)
+
+    # H-11 猎头 / 代招帖 (用户明确不要中介渠道岗; 复用画像的「接受外包岗位」开关)
+    h11 = HardCheck("H-11", "猎头/代招帖", floor=floor)
+    if not profile.accept_outsourcing:
+        h11_evidence, h11_conf = headhunter_evidence(job)
+        h11.confidence = h11_conf
+        if h11_evidence:
+            h11.hit = True
+            h11.reason = "猎头/代招渠道发帖, 画像明确不接受中介渠道岗位"
+            h11.evidence = h11_evidence
+    checks.append(h11)
 
     return checks
 
@@ -1166,6 +1215,7 @@ _CATALOG_STATIC: dict[str, Any] = {
         {"code": "H-08", "label": "外包/驻场岗位", "detail": "推断为外包/劳务派遣/驻场岗位, 且画像不接受外包。判定逻辑: 置信度来自 job.signals['outsourcing'], >= floor 直接淘汰, < floor 标 REVIEW。"},
         {"code": "H-09", "label": "学历硬性不符", "detail": "岗位要求学历高于本人最高学历。判定逻辑: 岗位 edu.rank < 本人 edu.rank 即命中 (1=博士 2=硕士 3=本科 4=大专), 命中即淘汰(无置信度衰减, 学历要求是硬门槛)。画像未填学历时标 REVIEW。"},
         {"code": "H-10", "label": "经验年限硬性不符", "detail": "岗位要求最低年限超出本人总年限。判定逻辑: 超出 1 年以上直接淘汰, 1 年以内差距标 REVIEW 交 AI 核实。画像未填年限时标 REVIEW。"},
+        {"code": "H-11", "label": "猎头/代招帖", "detail": "BOSS 列表 API 的结构化标志识别中介渠道帖: 招聘者头衔含「猎头」或平台标记金牌猎头 → conf=1.0 直接淘汰; 代招标志 (proxyJob/proxyType) → 0.6; 匿名雇主 (公司名被替换成「某…公司」) → 0.5 标 REVIEW。闸门复用画像的「接受外包岗位」开关。"},
     ],
     "dimensions": [
         {
@@ -1282,6 +1332,11 @@ def _build_hard_check_threshold(code: str, profile: Profile) -> dict[str, Any]:
             "value": f"{profile.total_years} 年" if profile.total_years else "(未填)",
             "source": "profile.total_years",
             "source_label": "工作总年限",
+        },
+        "H-11": {
+            "value": profile.accept_outsourcing,
+            "source": "profile.accept_outsourcing",
+            "source_label": "是否接受外包 (猎头/代招复用此开关)",
         },
     }
     info = thresholds.get(code)

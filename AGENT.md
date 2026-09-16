@@ -174,6 +174,37 @@ python3 -m gaj snapshot diff --scope-link "https://www.zhipin.com/..." \
 - **Web 图鉴**左侧栏「数据口径」下的「快照」选择器可浏览该口径的历史快照（市场观察的薪资/热力/雷达/技能生效，需先选口径；雇主画像与公司象限走实时）。口径切换时快照选择自动重置。
 - **gaj-reporter** 可用指定数据包出报告：`--source bundle --bundle <hist.bundle.json>`（用之前导出的 bundle JSON 快照复显，不依赖 gaj 实时接口）。
 
+### 场景十：口径扩池（换筛选条件把单口径挖深）
+
+**单口径的岗位池会见顶**：BOSS 列表 API 的 `resCount` 是虚高数字 —— 实测
+`AI测试@杭州` 报 `resCount=450`，实际第 1、2 页各 15 条互不重叠、第 3 页起全是重复，
+单口径实得 ≈30 条。要更多同口径岗位，靠**换筛选条件**（每换一组就换一批结果）。
+
+```bash
+# 列出已验证的城市码（未验证的城市请用 --city-code 传裸码，勿猜）
+python3 -m gaj scope-urls --list-cities
+
+# 生成口径 URL：第一个关键词跑全量组合(38 条)，其余同族词跑精选组合(17 条)
+python3 -m gaj scope-urls --city 杭州 \
+    --keywords "AI测试,大模型评测,模型评测,AI评测" \
+    --label --out /tmp/scopes.txt --pretty
+
+# 逐条采集（每条 URL 天然是一个 source_link 口径，快照/报告口径隔离自动生效）
+python3 -m gaj crawl "https://www.zhipin.com/web/geek/jobs?query=AI%E6%B5%8B%E8%AF%95&city=101210100&experience=105"
+
+# 给口径起可读名（用于报告标题）
+python3 -m gaj scope-link rename --link "<url>" --label "杭州·AI测试·3-5年"
+```
+
+- 维度：求职类型 / 薪资 / 经验 / 学历 / 规模 / 融资阶段；编码来自页面筛选下拉的 `ka` 属性。
+- **编码会随 BOSS 改版漂移**，用 `python3 -m gaj export-filter-codes`（需已登录页面）重新导出，
+  它会与内置码表 diff 并把结果写进 `references/boss_filter_codes.json`（生成器优先读它）。
+- 城市码：内置只收录**已验证**的 6 城（北京/上海/广州/深圳/杭州/南京）。其余城市用
+  `--city-code` 传裸码（从页面 URL 的 `city=` 读），或写进 `references/boss_city_codes.json`
+  （`{"cities": {"衢州": "101211000"}}`）后即可按城市名使用。
+- 扩池是**多口径采集**，别一次性全跑：每条 crawl 之间有风控成本，建议拆分（每次几条 + 间隔），
+  只跑与画像口径相关的那部分（如只要 3-5 年 + 20-50K，就跑精选组合）。
+
 ## 容错与超时保障
 
 所有命令都有最外层异常兜底：**任何情况下都会输出 JSON 信封并以退出码结束，
@@ -225,7 +256,9 @@ python3 -m gaj snapshot diff --scope-link "https://www.zhipin.com/..." \
 更新 `last_dup_page`（下次从更后面续翻）。这样既优先采最新职位（前几页），
 又不会让后面的旧职位一直采不到，多次运行逐步覆盖全部页面。
 
-你也可以调大 `--max-pages` 或换筛选条件更窄的 URL 减少重复率。
+你也可以调大 `--max-pages` 或**换筛选条件更窄的 URL 减少重复率**——后者可以用
+`python3 -m gaj scope-urls` 批量生成（见「场景十：口径扩池」），每条 URL 是一个独立
+口径，重复率天然比同一个宽口径低。
 
 ## 注意事项
 

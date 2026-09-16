@@ -74,6 +74,9 @@ class MigrationReport:
     city_missing: list[str] = field(default_factory=list)
     salary_fixed: list[tuple[str, str, str]] = field(default_factory=list)
     denoised: list[str] = field(default_factory=list)
+    #: 从 _debug/joblist_page_*.json 回填了列表 API 字段的职位 (招聘者/金牌猎头/
+    #: 匿名/代招等) —— 老数据没有这些文件时为空, 属正常。
+    list_api_items: list[str] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
@@ -92,6 +95,10 @@ class MigrationReport:
                 lines.append(f"      {jid[:12]}… {raw} -> {fixed}")
         if self.denoised:
             lines.append(f"  清洗反爬污染  : {len(self.denoised)}")
+        if self.list_api_items:
+            lines.append(
+                f"  回填列表API字段: {len(self.list_api_items)} (招聘者/金牌猎头/匿名/代招)"
+            )
         if self.anonymous_jobs:
             lines.append(f"  匿名雇主职位  : {len(self.anonymous_jobs)} (公司数据已隔离)")
         if self.quarantined_companies:
@@ -213,6 +220,31 @@ def _legacy_list_item(rec: LegacyRecord, city: str, district: str) -> dict:
     return item
 
 
+def load_list_items(src: Path) -> dict[str, dict]:
+    """从采集目录读出「职位 ID → 列表 API 原始项」映射。
+
+    爬虫把每页原始列表响应整份存进 ``_debug/joblist_page_NN.json``
+    (boss_scraper.storage.save_job_list_raw)。列表项里有招聘者、金牌猎头、
+    匿名雇主、代招等结构化字段 —— 详情页 DOM 根本没有这些信息, 合成的最小
+    list_item 也补不出来, 所以按 encryptJobId 建一张索引交给 Job.build。
+
+    目录或文件缺失时返回空 dict (老数据没有 _debug/ 属正常)。
+    """
+    out: dict[str, dict] = {}
+    debug_dir = src / "_debug"
+    if not debug_dir.is_dir():
+        return out
+    for page_file in sorted(debug_dir.glob("joblist_page_*.json")):
+        payload = _read_json(page_file)
+        for item in payload.get("jobList") or []:
+            if not isinstance(item, dict):
+                continue
+            jid = item.get("encryptJobId")
+            if jid:
+                out[jid] = item
+    return out
+
+
 def _migrate_record(
     rec: LegacyRecord,
     *,
@@ -224,6 +256,7 @@ def _migrate_record(
     dry_run: bool = False,
     report: MigrationReport | None = None,
     source_link: str = "",
+    list_items: dict[str, dict] | None = None,
 ) -> bool:
     """迁移单条老格式记录到 data/。
 
@@ -290,12 +323,18 @@ def _migrate_record(
         report.companies += 1
     company_cache[brand_id] = company
 
-    # ---- 城市回填 ----
+    # ---- 列表 API 原始项: 有则优先 (招聘者 / 匿名 / 代招只能从这里拿到) ----
+    api_item = (list_items or {}).get(job_id)
+    api_city = nz.normalize_city(api_item.get("cityName", "")) if api_item else ""
+
+    # ---- 城市回填: 列表 API > 详情页地址 > 人工假定 ----
     address = rec.jd_dom.get("company_address") or rec.structured.get(
         "company_address", ""
     )
     city, district, _rest = nz.split_address(address)
     city_source = "address"
+    if api_city:
+        city, city_source = api_city, "list_api"
     if city:
         report.city_filled += 1
     elif assume_city:
@@ -331,7 +370,7 @@ def _migrate_record(
 
     job = Job.build(
         job_id=job_id,
-        list_item=_legacy_list_item(rec, city, district),
+        list_item=api_item or _legacy_list_item(rec, city, district),
         jd_dom=jd_dom,
         company=company,
         blacklist=blacklist,
@@ -339,8 +378,12 @@ def _migrate_record(
     )
     job.crawled_at = rec.meta.get("crawled_at", job.crawled_at)
     job.first_seen = rec.meta.get("crawled_at", job.first_seen)
-    # list_item 是迁移时合成的, 不是真的抓到了列表 API
-    job.provenance["list_api"] = False
+    if api_item:
+        # 真的拿到了列表 API 原始项 (招聘者/金牌猎头/匿名/代招等字段已回填)
+        report.list_api_items.append(job_id)
+    else:
+        # 合成的最小 list_item 不算抓到了列表 API
+        job.provenance["list_api"] = False
     job.provenance["migrated_from"] = f"{src.name}/{rec.dirname}"
     job.provenance["company_page"] = bool(company_dom)
     job.provenance["city_source"] = city_source
@@ -476,6 +519,7 @@ def migrate_one(
         dry_run=dry_run,
         report=report,
         source_link=source_link,
+        list_items=load_list_items(src_dir.parent),
     )
     # 每入库一条到某口径, 同步登记注册表 (幂等, 保证 Web 口径管理立即可见)
     if report.migrated and source_link:
@@ -515,6 +559,11 @@ def migrate(
 
     company_cache: dict[str, Company] = {}
 
+    # 列表 API 原始项 (含招聘者/金牌猎头/匿名/代招) —— 一次读入, 全批共用
+    list_items = load_list_items(src)
+    if list_items:
+        log.info(f"读到列表 API 原始项 {len(list_items)} 条, 将回填招聘者等字段")
+
     for rec in records:
         _migrate_record(
             rec,
@@ -526,6 +575,7 @@ def migrate(
             dry_run=dry_run,
             report=report,
             source_link=source_link,
+            list_items=list_items,
         )
 
     # 批量迁移后如确有成岗位入某口径, 同步登记注册表 (幂等)

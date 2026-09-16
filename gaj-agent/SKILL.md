@@ -192,6 +192,13 @@ gaj-reporter 可用指定数据包复显历史报告：`--source bundle --bundle
 
 - 采集节奏模拟人工浏览，不要为提速改动节奏逻辑或并发多开 crawl。
 
+- **单口径池子会见顶**（同一筛选链接约 30 条后全是重复）：要更多岗位不要靠加
+  `--max-pages`，而是**换筛选条件**——`python3 -m gaj scope-urls --city <城市>
+  --keywords "<主词,同族词...>" --out <文件>` 生成一组口径 URL（每条 URL 一个口径，
+  快照/报告隔离自动生效），再逐条 `crawl`。别一次全跑：多口径采集有风控成本，
+  建议只跑与画像相关的那几组 + 每条之间留间隔。编码漂移时先
+  `python3 -m gaj export-filter-codes` 刷新。
+
 ## 验证
 
 每次调用确认：进程在预算内退出、stdout 可 `json.loads`、信封含 `ok` 字段：

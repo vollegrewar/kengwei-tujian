@@ -10,6 +10,9 @@
     python3 -m gaj fix-conflicts [--dry-run]  # 自动修复 brand_id 串号
     python3 -m gaj setup-chrome             # 启动 Chrome CDP 调试模式
     python3 -m gaj check                    # 检查环境
+    python3 -m gaj scope-urls --city 杭州 --keywords "AI测试,大模型评测"
+                                            # 生成口径 URL (关键词 × 筛选条件扩池)
+    python3 -m gaj export-filter-codes      # 从已登录页面刷新筛选编码表
     python3 -m gaj agent <command> ...      # 面向 AI 智能体的 JSON 接口
 """
 
@@ -124,6 +127,32 @@ def main(argv: list[str] | None = None) -> int:
     a_scope = sp_scope.add_parser("assign", help="把指定岗位归属到某口径链接 (写回 job.json 并重建索引)")
     a_scope.add_argument("--link", required=True, help="来源筛选链接")
     a_scope.add_argument("--job-ids", required=True, help="逗号分隔的 job_id 列表")
+
+    # ---- scope-urls (口径 URL 生成: 关键词 × 筛选条件扩池) ----
+    p = sub.add_parser(
+        "scope-urls", help="生成口径 URL (关键词 × 筛选条件扩池)"
+    )
+    p.add_argument("--city", help="城市名 (仅内置已验证城市, 见 --list-cities)")
+    p.add_argument("--city-code", help="BOSS city 码 (内置表没有的城市传裸码, 勿猜)")
+    p.add_argument("--keywords", help="逗号分隔关键词; 第一个当主词跑全量组合, 其余跑精选")
+    p.add_argument(
+        "--mode", default="auto",
+        choices=["auto", "full", "selected", "baseline"],
+        help="auto=主词 full + 其余 selected (默认)",
+    )
+    p.add_argument("--out", help="把 URL 逐行写进文件 (便于一条条 crawl)")
+    p.add_argument("--label", action="store_true", help="附带建议口径名 (供 scope-link rename)")
+    p.add_argument("--list-cities", action="store_true", help="只列内置城市码")
+    p.add_argument("--pretty", action="store_true", help="JSON 缩进输出")
+
+    # ---- export-filter-codes (刷新筛选编码表) ----
+    p = sub.add_parser(
+        "export-filter-codes", help="从已登录页面刷新筛选编码表 (ka 属性)"
+    )
+    p.add_argument("--dry-run", action="store_true", help="只 diff 不落盘")
+    p.add_argument("--out", help="导出路径 (默认 references/boss_filter_codes.json)")
+    p.add_argument("--url", help="起始页 URL (默认带筛选控件的搜索页)")
+    p.add_argument("--cdp-port", type=int, default=None, help="CDP 端口 (默认配置值)")
 
     # ---- snapshot (同口径多采集快照: 只读 list / diff) ----
     p_snap = sub.add_parser("snapshot", help="同口径采集快照 (只读): list / diff")
@@ -352,6 +381,113 @@ def main(argv: list[str] | None = None) -> int:
                 index.reindex()
                 print(f"✓ 已归属 {changed}/{len(ids)} 个岗位到口径: {args.link} (索引已重建)")
                 return 0
+
+    if args.command == "scope-urls":
+        import json as _json
+
+        from .core import scope_urls as su
+
+        if args.list_cities:
+            print(_json.dumps({
+                "cities": su.load_city_codes(),
+                "source": su.CITY_CODES_SOURCE,
+                "note": "未列入的城市请用 --city-code 传裸码 (从页面 URL 的 city= 读), 不要猜",
+                "override_file": str(su.CITY_CODES_FILE),
+            }, ensure_ascii=False, indent=2))
+            return 0
+
+        if not args.keywords:
+            print("❌ 需要 --keywords (逗号分隔; 或 --list-cities 查看城市码)", file=sys.stderr)
+            return 2
+        kws = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        if args.city_code:
+            city, city_code = args.city or args.city_code, args.city_code
+        elif args.city:
+            city_code = su.resolve_city_code(args.city)
+            if not city_code:
+                print(
+                    f"❌ 未知城市 {args.city!r}: 内置只收录已验证城市 "
+                    f"{sorted(su.load_city_codes())}, 请用 --city-code 传裸码",
+                    file=sys.stderr,
+                )
+                return 2
+            city = args.city
+        else:
+            print("❌ 需要 --city 或 --city-code", file=sys.stderr)
+            return 2
+
+        if args.mode == "auto":
+            items = su.build_scope_urls(city, kws)
+            note = "主词 full + 其余 selected"
+        else:
+            items = []
+            seen: set[str] = set()
+            for item in su.build_urls(kws[0], city_code, args.mode):
+                if item["url"] not in seen:
+                    seen.add(item["url"])
+                    items.append(item)
+            note = f"全部关键词用 {args.mode}"
+        for it in items:
+            if args.label:
+                it["suggested_label"] = su.suggest_label(it["url"], city_name=city)
+
+        if args.out:
+            from pathlib import Path as _Path
+
+            _Path(args.out).write_text(
+                "\n".join(it["url"] for it in items) + "\n", encoding="utf-8"
+            )
+        codes, codes_source = su.load_filter_codes()
+        print(_json.dumps({
+            "ok": True,
+            "city": city,
+            "city_code": city_code,
+            "keywords": kws,
+            "mode": args.mode,
+            "mode_note": note,
+            "url_count": len(items),
+            "per_keyword_full": su.combo_count("full"),
+            "per_keyword_selected": su.combo_count("selected"),
+            "filter_codes_source": codes_source,
+            "out": args.out or "",
+            "urls": items,
+            "next_steps": [
+                "逐条采集: python3 -m gaj crawl \"<url>\" (每条 URL 即一个 source_link 口径)",
+                "批量建议后台跑 + 每条之间留人工间隔, 避免触发风控",
+                "口径命名: python3 -m gaj scope-link rename --link \"<url>\" --label \"<建议名>\"",
+            ],
+        }, ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+
+    if args.command == "export-filter-codes":
+        import json as _json
+        from pathlib import Path as _Path
+
+        from .scraper.filter_codes import DEFAULT_URL, export_filter_codes
+
+        try:
+            out = export_filter_codes(
+                cdp_port=args.cdp_port,
+                url=args.url or DEFAULT_URL,
+                out_path=_Path(args.out) if args.out else None,
+                dry_run=args.dry_run,
+            )
+        except Exception as exc:
+            print(f"❌ 导出失败: {exc}", file=sys.stderr)
+            return 1
+        print(_json.dumps({
+            "ok": True,
+            "exported_at": out["exported_at"],
+            "source_url": out["source_url"],
+            "dropdown_count": out["dropdown_count"],
+            "dimension_sizes": {k: len(v) for k, v in out["dimensions"].items()},
+            "diffs": out["diffs"],
+            "diff_count": len(out["diffs"]),
+            "written": out["written"],
+            "out_path": out["out_path"],
+            "note": "diff 为空 = 页面编码与内置码表一致; 有 diff 时确认后再 --dry-run 复核",
+        }, ensure_ascii=False, indent=2))
+        return 0
 
     if args.command == "strategy":
         from . import strategy

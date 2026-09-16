@@ -298,6 +298,11 @@ class Job:
                 "cert": li.get("bossCert"),
                 "online": li.get("bossOnline"),
                 "gold_hunter": bool(li.get("goldHunter")),
+                # 列表 API 直接给出的结构化标志, 用于识别猎头/代招帖 (H-11),
+                # 不必再从 DOM 文本里猜。
+                "anonymous": bool(li.get("anonymous")),
+                "proxy_job": bool(li.get("proxyJob")),
+                "proxy_type": li.get("proxyType") or 0,
             },
             company_id=company.brand_id or li.get("encryptBrandId", ""),
             company_name=company.name or clean_text(li.get("brandName", "")),
@@ -310,6 +315,11 @@ class Job:
         )
 
         obj.quality = obj._assess_quality()
+
+        # 列表 API 的匿名雇主标志 (anonymous=1) 与公司名「某…公司」是同一种帖,
+        # 统一落成 employer_anonymous, 让 A-08 / 打分规则复用同一个入口。
+        if obj.boss.get("anonymous"):
+            obj.provenance["employer_anonymous"] = True
 
         if existing:
             obj.first_seen = existing.first_seen

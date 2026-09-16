@@ -30,6 +30,7 @@
 | H-08 | 外包/驻场岗位 | JD 信号 `outsourcing==True` 且 `profile.accept_outsourcing=False` | 画像: 是否接受外包 + JD 信号 | 置信度来自信号推断 |
 | H-09 | 学历硬性不符 | 岗位 `edu.rank` < 本人 `profile.education_rank()` (rank 越小要求越高: 1=博士 2=硕士 3=本科 4=大专) | 画像: 最高学历 | 画像未填 conf=0.4 (REVIEW); 命中 conf=1.0 |
 | H-10 | 经验年限硬性不符 | 岗位 `exp.min_years` > 本人 `total_years + 1` → fatal; 1 年以内差距 → REVIEW | 画像: 工作总年限 | 画像未填 conf=0.4; 超出 1 年以上 conf=1.0; 1 年内 conf=0.5 |
+| H-11 | 猎头/代招帖 | 招聘者含「猎头」/ 金牌猎头 / 代招标志 (`proxyJob`,`proxyType`) / 匿名雇主; 闸门 `profile.accept_outsourcing=False` | BOSS 列表 API 结构化字段 (无画像阈值, 复用「是否接受外包」) | 招聘者含猎头、金牌猎头 conf=1.0 (fatal); 代招 conf=0.6 (fatal); 匿名雇主 conf=0.5 (REVIEW) |
 
 **置信度机制**:
 - `confidence ≥ 0.6` (默认 `reject_confidence_floor`) → `fatal` (直接淘汰)
