@@ -193,6 +193,9 @@ class JobCrawler:
                      本次前几页全重复时跳到该页续翻, 避免重复扫已覆盖的前段、
                      漏掉更靠后的新职位。0 表示没有可用的续翻锚点。
         resume_probe_pages: 跳过前几页全重复后再续翻的探测页数 (见 dup_stop_pages)。
+        on_progress: 可选进度回调 on_progress(payload: dict) —— 在采集开始/每页/
+                     每个职位处理完/结束时调用, 供上层把进度落盘 (agent 轮询用)。
+                     回调内部异常会被吞掉, 绝不影响采集。
     """
 
     def __init__(
@@ -212,6 +215,8 @@ class JobCrawler:
         resume_page: int = 0,
         resume_probe_pages: int = 3,
         start_page: int = 0,
+        job_budget: Optional[int] = None,
+        on_progress: Optional[Callable[[dict], None]] = None,
     ):
         self.cdp_port = cdp_port
         self.jobs_dir = jobs_dir
@@ -232,11 +237,32 @@ class JobCrawler:
         # 手动指定起始翻页数 (0=默认从第 1 页开始)。>0 时跳过前面的已覆盖段,
         # 直接从该页开始继续采集。
         self.start_page = max(start_page, 0)
+        # 本次采集最多新抓多少个职位 (24h 滚动窗口的剩余配额, 由调用方算好)。
+        # None = 不限; 0 = 配额已用尽, 一个都不采 (达到即停止,
+        # early_stop_reason="budget_24h")。注意 0 不等于不限。
+        self.job_budget = None if job_budget is None else max(int(job_budget), 0)
         self._resumed = False
         self._resume_dup_streak = 0
         # 当前连续"整页全重复"的页数 (运行时状态)
         self._dup_streak = 0
         self.stats = CrawlStats()
+        # 进度回调 (可选): 采集开始/每页/每职位/结束时发射, 异常全吞
+        self.on_progress = on_progress
+
+    def _emit_progress(self, event: str, **extra) -> None:
+        """向 on_progress 发射进度事件; 回调不存在或抛异常都静默跳过。"""
+        if not self.on_progress:
+            return
+        try:
+            payload = {
+                "event": event,
+                "current_page": self.stats.total_pages,
+                "stats": self.stats.to_dict(),
+            }
+            payload.update(extra)
+            self.on_progress(payload)
+        except Exception:
+            pass
 
     def _dup_delay(self):
         """根据当前连续重复页数计算翻页延迟区间。
@@ -251,6 +277,40 @@ class JobCrawler:
         d_min = min(self.delay_min * factor, self.slowdown_cap)
         d_max = min(self.delay_max * factor, self.slowdown_cap * 1.5)
         return d_min, d_max, factor
+
+    def _record_resume_anchor(self, page: int) -> None:
+        """记录续翻锚点: 只进不退, 避免把上次更深的断点冲掉。
+
+        本次从第 1 页重扫时, 若在很浅的页码上就停止(列表 API 被反爬拒绝等),
+        直接记该页码会把上次存下的深断点覆盖成浅页码, 下次只能在浅页附近
+        打转, 永远翻不到断点之后的内容。故记录值不得浅于本次载入的续翻锚点。
+
+        真正翻到底(hasMore=False)是显式重置为 0, 不走这里。
+        手动 --start-page 指定了起始页时, 以调用方指定为准, 不做下限保护。
+        """
+        floor = self.resume_page if self.start_page <= 1 else 0
+        target = max(page, floor)
+        if target > self.stats.last_dup_page:
+            self.stats.last_dup_page = target
+            self.stats.last_dup_page_dirty = True
+            if target != page:
+                log.info(
+                    f"续翻锚点取 {target} (本次停止于第 {page} 页, "
+                    f"不浅于已存断点第 {floor} 页)"
+                )
+
+    def _budget_reached(self) -> bool:
+        """本次采集的 24h 配额是否已用尽 (job_budget 为 None 表示不限)。"""
+        return self.job_budget is not None and self.stats.jobs_scraped >= self.job_budget
+
+    def _stop_by_budget(self, page: int) -> None:
+        """配额用尽: 记录续翻锚点并结束本次采集。"""
+        log.warning(
+            f"已达到 24 小时采集配额 {self.job_budget} 个岗位, 提前结束 "
+            f"(下次从第 {page} 页续采)"
+        )
+        self.stats.early_stop_reason = "budget_24h"
+        self._record_resume_anchor(page)
 
     def crawl_from_url(self, list_url: str, har_path: Optional[str] = None,
                        on_page_seen=None):
@@ -275,6 +335,13 @@ class JobCrawler:
         log.info(f"翻页延迟: {self.delay_min}-{self.delay_max}s")
         log.info(f"抓取公司页: {self.fetch_company}")
         log.info(f"保存目录: {self.jobs_dir}")
+        self._emit_progress(
+            "start",
+            url=list_url,
+            max_pages=self.max_pages,
+            delay=[self.delay_min, self.delay_max],
+            fetch_company=self.fetch_company,
+        )
 
         # --- 步骤 1: (可选) 解析 HAR 文件 ---
         search_params = None
@@ -340,14 +407,19 @@ class JobCrawler:
                 if self.max_pages and page > self.max_pages:
                     log.info(f"已达到最大翻页数 {self.max_pages}, 停止")
                     # 记录续翻锚点: 下次从该页接着翻, 不再从头重扫已覆盖的前段
-                    self.stats.last_dup_page = page
-                    self.stats.last_dup_page_dirty = True
+                    self._record_resume_anchor(page)
+                    break
+
+                if self._budget_reached():
+                    # 配额在上一页末就用尽, 不再多调一次列表 API
+                    self._stop_by_budget(page)
                     break
 
                 log.info(f"\n{'='*40}")
                 log.info(f"正在采集第 {page} 页...")
                 log.info(f"{'='*40}")
                 self.stats.total_pages = page
+                self._emit_progress("page_start", page=page)
 
                 # 获取职位列表
                 api_data = fetch_job_list_with_retry(
@@ -357,8 +429,8 @@ class JobCrawler:
                 if api_data is None:
                     log.error(f"第 {page} 页获取失败, 终止翻页")
                     # 记录续翻锚点: 本次已处理到第 page-1 页, 下次从第 page 页继续
-                    self.stats.last_dup_page = page
-                    self.stats.last_dup_page_dirty = True
+                    # (只进不退, 反爬拒绝浅页时不会冲掉更深的已存断点)
+                    self._record_resume_anchor(page)
                     break
 
                 # 保存原始 API 响应 (调试用)
@@ -370,6 +442,10 @@ class JobCrawler:
                 log.info(
                     f"第 {page} 页: {len(job_list)} 个职位, "
                     f"hasMore={has_more}, resCount={res_count}"
+                )
+                self._emit_progress(
+                    "page_list", page=page, page_total=len(job_list),
+                    has_more=has_more,
                 )
 
                 if not job_list:
@@ -389,7 +465,12 @@ class JobCrawler:
 
                 # 逐个处理职位
                 dup_on_page = 0
+                budget_hit = False
                 for idx, job_item in enumerate(job_list, 1):
+                    if self._budget_reached():
+                        # 配额用尽: 本页剩余职位不再抓, 直接收尾
+                        budget_hit = True
+                        break
                     encrypt_job_id = job_item.get("encryptJobId", "")
                     job_name = job_item.get("jobName", "")
                     brand_name = job_item.get("brandName", "")
@@ -407,9 +488,15 @@ class JobCrawler:
                         log.info(f"  → 已采集过, 跳过")
                         self.stats.jobs_skipped_dup += 1
                         dup_on_page += 1
+                        self._emit_progress(
+                            "job", page=page, idx=idx, page_total=len(job_list),
+                            job_id=encrypt_job_id, job_name=job_name,
+                            brand_name=brand_name, status="skipped_dup",
+                        )
                         continue
 
                     # 抓取职位详情
+                    job_status = "saved"
                     try:
                         self._scrape_one_job(
                             ws,
@@ -421,8 +508,19 @@ class JobCrawler:
                     except Exception as e:
                         log.error(f"  → 抓取失败: {e}")
                         self.stats.jobs_failed += 1
+                        job_status = "failed"
                         # 出错后等待一下, 避免连续错误
                         time.sleep(random.uniform(2, 5))
+                    self._emit_progress(
+                        "job", page=page, idx=idx, page_total=len(job_list),
+                        job_id=encrypt_job_id, job_name=job_name,
+                        brand_name=brand_name, status=job_status,
+                    )
+
+                if budget_hit:
+                    # 配额用尽, 不再走本页覆盖率/续翻判定, 直接结束本次采集
+                    self._stop_by_budget(page)
+                    break
 
                 # --- 覆盖率统计: 本页是否全是已抓取的重复职位 ---
                 new_on_page = len(job_list) - dup_on_page
@@ -437,6 +535,10 @@ class JobCrawler:
                     )
                 else:
                     self._dup_streak = 0
+                self._emit_progress(
+                    "page_end", page=page, dup_streak=self._dup_streak,
+                    has_more=has_more,
+                )
 
                 # 连续多页全重复 → 搜索结果已覆盖, 提前结束
                 if self.dup_stop_pages and self._dup_streak >= self.dup_stop_pages:
@@ -465,8 +567,7 @@ class JobCrawler:
                         f"判定该搜索条件下的职位已覆盖, 提前结束以避免触发反爬"
                     )
                     self.stats.early_stop_reason = "covered"
-                    self.stats.last_dup_page = page
-                    self.stats.last_dup_page_dirty = True
+                    self._record_resume_anchor(page)
                     break
 
                 # 判断是否继续翻页
@@ -492,8 +593,7 @@ class JobCrawler:
             # 记录最后正在处理的页码作为续翻锚点:
             # 该页可能未全部处理完, 下次从该页重扫(已抓的自动跳过)再继续往后。
             if self.stats.total_pages:
-                self.stats.last_dup_page = self.stats.total_pages
-                self.stats.last_dup_page_dirty = True
+                self._record_resume_anchor(self.stats.total_pages)
         except Exception as e:
             log.error(f"采集流程异常: {e}")
             import traceback
@@ -519,6 +619,9 @@ class JobCrawler:
         log.info("采集完成")
         log.info("=" * 60)
         log.info(str(self.stats))
+        self._emit_progress(
+            "done", early_stop_reason=self.stats.early_stop_reason
+        )
 
     def _scrape_one_job(self, ws, detail_sid, job_item, scraped_ids):
         """抓取单个职位 (详情页 + 公司页)

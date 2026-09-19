@@ -74,10 +74,10 @@ def isolated_repo(tmp_path_factory, monkeypatch):
     """把 repo 文件侧 + index.db 重定向到临时目录 (每测试后自动还原)。
 
     仅 test_rescrape_same_job_no_duplicate 与 test_reassign_source_links
-    会走文件仓储 (repo.save_job / active_epoch_id / register_source_link),
-    其余测试都用 :memory: conn, 本就碰不到真实 data/。这两个测试在一个
-    临时数据根上串行 (先写 j10 再重归属), 故用模块级共享路径 + 函数级
-    monkeypatch 还原, 杜绝把 https://new 这类测试口径写进真实库。
+    会走文件仓储 (repo.save_job / index.connect 的文件库), 其余测试都用
+    :memory: conn, 本就碰不到真实 data/。两个测试共用模块级临时数据根 +
+    函数级 monkeypatch 还原 (各自造独立 job_id, 互不依赖), 杜绝把
+    https://new 这类测试口径写进真实库。
     """
     global _TMP_DATA_ROOT
     from gaj import config as cfg
@@ -106,7 +106,7 @@ def _walk_keys(obj):
 
 def test_bundle_top_level_contract(conn):
     bundle = reportbundle.build_report_bundle(conn)
-    assert bundle["schema_version"] == "3.0"
+    assert bundle["schema_version"] == "3.1"
     assert set(bundle) >= {
         "schema_version", "generated_at", "data_fingerprint",
         "meta", "quality", "market", "focus",
@@ -352,7 +352,7 @@ def test_v22_board_pool_sizes(conn):
         _insert_job(conn, f"jx{i:02d}", f"cx{i:02d}", f"池公司{i:02d}", "无锡", "计算机软件", 20 + i % 10, 3)
     conn.commit()
     bundle = reportbundle.build_report_bundle(conn)
-    assert bundle["schema_version"] == "3.0"
+    assert bundle["schema_version"] == "3.1"
     assert len(bundle["market"]["company_boards"]["hiring"]) <= 30
     assert len(bundle["market"]["company_boards"]["hiring"]) > 10, "池应超过旧版 top10"
     assert len(bundle["market"]["skill_leaderboard"]["items"]) <= 30
@@ -366,14 +366,19 @@ def test_v22_board_pool_sizes(conn):
 
 
 def test_scope_link_isolation(conn):
-    """v2.3 口径隔离: 指定 source_link 后聚合只含该口径, 未分口径不混入。"""
+    """v2.3 口径隔离: 指定 source_link 后聚合只含该口径, 未分口径不混入。
+
+    注: 夹具用直改 SQL 的 source_link 造数 (绕过成员写入路径), 依赖
+    build_report_bundle(scope_link=…) 内 sync_scope_members 的存量兜底回填
+    成 scope_members 成员行后才圈定 —— 非正规 sighting 路径, 成员语义见
+    observatory_snapshot.sync_scope_members。"""
     conn.execute("UPDATE jobs SET source_link = 'https://example.com/list?city=1' "
                  "WHERE company_id IN ('c1','c2')")
     conn.execute("UPDATE jobs SET source_link = 'https://example.com/list?city=2' "
                  "WHERE company_id = 'c4'")
     conn.commit()
     all_bundle = reportbundle.build_report_bundle(conn)
-    assert all_bundle["schema_version"] == "3.0"
+    assert all_bundle["schema_version"] == "3.1"
     assert all_bundle["meta"]["job_count"] == 16
 
     scope_a = reportbundle.build_report_bundle(conn, scope_link="https://example.com/list?city=1")
@@ -413,6 +418,80 @@ def test_scope_rename_and_label(conn):
     assert b["meta"]["scope"]["scope_label"] == "无锡-后端-双休"
 
 
+def test_snapshot_bundle_freezes_member_set(conn):
+    """v3.1 按快照出报告: 影子换成 snapshot_members, 快照后新采集岗位不混入;
+    读快照不再顺手固化新快照; 指纹与口径包不同。
+
+    注: 夹具直改 SQL 的 source_link 由 sync_scope_members 兜底回填成员行
+    (last_epoch_id='' → 落入快照圈定的空纪元容差), 新岗位 j60 同理在
+    b_full 时被回填后才计入 —— 均为直改 DB 的存量桥接路径。"""
+    from gaj.store import observatory_snapshot as obsnap
+
+    link = "https://example.com/list?city=1"
+    conn.execute("UPDATE jobs SET source_link = ? WHERE company_id IN ('c1','c2')", (link,))
+    conn.commit()
+
+    b_scope = reportbundle.build_report_bundle(conn, scope_link=link)
+    n_scope = b_scope["meta"]["scope"]["job_count"]
+    assert n_scope == 8
+    snaps = obsnap.list_snapshots(conn, link)
+    assert len(snaps) == 1, "带 scope 导出顺手固化一份快照"
+    snap_id = snaps[0]["snapshot_id"]
+
+    # 快照后新采集: 再补 1 个同口径岗位 (全量口径会混入)
+    _insert_job(conn, "j60", "c1", "甲公司一", "无锡", "计算机软件", 21, 3)
+    conn.execute("UPDATE jobs SET source_link = ? WHERE job_id = 'j60'", (link,))
+    conn.commit()
+
+    b_snap = reportbundle.build_report_bundle(conn, snapshot_ref=snap_id)
+    assert b_snap["schema_version"] == "3.1"
+    assert b_snap["meta"]["job_count"] == n_scope, "快照成员集冻结, 新采集岗位不混入"
+    snap_block = b_snap["meta"]["snapshot"]
+    assert snap_block["snapshot_id"] == snap_id
+    assert snap_block["source_link"] == link
+    assert snap_block["snapshot_job_count"] == n_scope
+    assert snap_block["member_count"] == n_scope
+    assert snap_block["missing_members"] == 0
+    assert b_snap["meta"]["scope"]["scope_link"] == link, "未给口径时自动采用快照口径"
+    assert b_snap["data_fingerprint"] != b_scope["data_fingerprint"]
+    # 读快照不再固化新快照
+    assert len(obsnap.list_snapshots(conn, link)) == 1
+
+    # 对照: 全量口径会计入新岗位
+    b_full = reportbundle.build_report_bundle(conn, scope_link=link)
+    assert b_full["meta"]["scope"]["job_count"] == n_scope + 1
+
+
+def test_snapshot_ref_resolution_errors(conn):
+    """引用解析: snapshot_id 全局可查; period 引用须带口径; 口径不一致 / 不存在即报错。"""
+    from gaj.store import observatory_snapshot as obsnap
+
+    link = "https://example.com/list?city=1"
+    conn.execute("UPDATE jobs SET source_link = ? WHERE company_id = 'c1'", (link,))
+    conn.commit()
+    reportbundle.build_report_bundle(conn, scope_link=link)
+    snap_id = obsnap.list_snapshots(conn, link)[0]["snapshot_id"]
+
+    # snapshot_id 引用无需口径
+    b = reportbundle.build_report_bundle(conn, snapshot_ref=snap_id)
+    assert b["meta"]["snapshot"]["snapshot_id"] == snap_id
+    # period_month 引用 + 口径 → 该口径最新一份
+    b2 = reportbundle.build_report_bundle(
+        conn, snapshot_ref=b["meta"]["snapshot"]["period_month"], scope_link=link)
+    assert b2["meta"]["snapshot"]["snapshot_id"] == snap_id
+    # 不存在
+    with pytest.raises(reportbundle.SnapshotRefError):
+        reportbundle.build_report_bundle(conn, snapshot_ref="nope")
+    # period 引用未带口径
+    with pytest.raises(reportbundle.SnapshotRefError):
+        reportbundle.build_report_bundle(
+            conn, snapshot_ref=b["meta"]["snapshot"]["period_month"])
+    # 口径不一致
+    with pytest.raises(reportbundle.SnapshotRefError):
+        reportbundle.build_report_bundle(conn, snapshot_ref=snap_id,
+                                         scope_link="https://other")
+
+
 def test_rescrape_same_job_no_duplicate(conn, isolated_repo):
     """口径去重锁定: 同一岗位被第二个来源链接重采 (upsert) 后,
     库内仍只有一行且归属最新口径 —— 合并展示永不产生重复岗位。"""
@@ -445,18 +524,173 @@ def test_skill_board_same_as_observatory(conn):
 
 
 def test_reassign_source_links(tmp_path, isolated_repo):
-    """列表级口径重归属: 列表出现的历史岗位挪入新口径; 库外岗位跳过。"""
+    """列表级口径成员只增登记: 库中已有岗位完成成员登记 (reassigned 只计本次
+    新增); 岗位 source_link 冻结首归不改写; 库外岗位跳过; 重复调用幂等。"""
+    from gaj.core.models import Job
     from gaj.store import repo
     from gaj.store.migrate import reassign_source_links
 
-    # j10 在库 (fixture); zzz-not-in-db 仅出现在列表文件中, 库内无对应岗位
+    old_link, new_link = "https://old", "https://new"
+    # ra1 在库 (文件 + 索引, 首归 old); zzz-not-in-db 仅出现在列表文件中, 库内无对应岗位
+    job = Job.build(job_id="ra1",
+                    list_item={"jobName": "岗位ra1", "salaryDesc": "20k", "cityName": "无锡"},
+                    jd_dom={"jd_full": "x"}, company=None, blacklist=set())
+    repo.save_job(job)
+    repo.update_source_link("ra1", old_link)  # 文件侧首归 (migrate/adapter 同款)
+    conn = index.connect()  # tmp INDEX_DB (isolated_repo)
+    try:
+        index.upsert_job(conn, repo.load_job("ra1"), refresh_company=False)
+        conn.commit()
+    finally:
+        conn.close()
+
     debug = tmp_path / "_debug"
     debug.mkdir()
     (debug / "joblist_page_01.json").write_text(json.dumps({
-        "zpData": {"jobList": [{"encryptJobId": "j10"}, {"encryptJobId": "zzz-not-in-db"}]}
+        "zpData": {"jobList": [{"encryptJobId": "ra1"}, {"encryptJobId": "zzz-not-in-db"}]}
     }), encoding="utf-8")
-    out = reassign_source_links(tmp_path, "https://new")
-    assert out == {"seen": 2, "reassigned": 1}, "库外岗位跳过"
-    j = repo.load_job("j10")
-    assert j.source_link == "https://new", "历史岗位挪入新口径"
+
+    def _member_rows():
+        c = index.connect()
+        try:
+            return sorted(tuple(r) for r in c.execute(
+                "SELECT source_link, job_id, first_seen_at, last_epoch_id"
+                " FROM scope_members WHERE job_id = 'ra1'"))
+        finally:
+            c.close()
+
+    out = reassign_source_links(tmp_path, new_link)
+    assert out == {"seen": 2, "reassigned": 1}, "库外岗位跳过, 库内岗位完成成员登记"
     assert repo.load_job("zzz-not-in-db") is None
+    rows = _member_rows()
+    assert {r[0] for r in rows} == {old_link, new_link}, "scope_members 出现新口径成员行, 旧口径保留"
+
+    # 首归冻结: jobs.source_link (DB + 文件) 保持不变, 文件侧 scope_links append-only
+    c = index.connect()
+    try:
+        db_link = c.execute("SELECT source_link FROM jobs WHERE job_id='ra1'").fetchone()[0]
+    finally:
+        c.close()
+    assert db_link == old_link
+    j = repo.load_job("ra1")
+    assert j.source_link == old_link
+    assert j.provenance["scope_links"] == [old_link, new_link]
+
+    # 重复调用幂等: reassigned=0, 成员行 (含 last_epoch_id) 不变
+    out2 = reassign_source_links(tmp_path, new_link)
+    assert out2 == {"seen": 2, "reassigned": 0}
+    assert _member_rows() == rows
+
+
+def test_overlap_scope_no_steal(tmp_path, monkeypatch):
+    """黄金回归 (2026-09-15 事故): 重叠口径 sighting 只增成员 —— 不翻走
+    jobs.source_link、不动 A 的成员行/纪元、不稀释 A 的影子与快照。
+    capture 会推进纪元, 「B sighting 前后」对照用两套独立数据根夹具。"""
+    from gaj import config as cfg
+    from gaj.core.models import Job
+    from gaj.store import observatory_snapshot as obsnap, repo
+
+    link_a, link_b = "https://overlap/list-a", "https://overlap/list-b"
+
+    def _setup_root(root):
+        """独立数据根: repo 文件侧 + index.db 全部指向 root。"""
+        (root / "jobs").mkdir(parents=True, exist_ok=True)
+        (root / "companies").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(cfg, "DATA_ROOT", root)
+        monkeypatch.setattr(cfg, "JOBS_DIR", root / "jobs")
+        monkeypatch.setattr(cfg, "COMPANIES_DIR", root / "companies")
+        monkeypatch.setattr(cfg, "INDEX_DB", root / "index.db")
+
+    def _sight_via_a():
+        """正规路径: 口径 A 采集岗位 ov1 (文件首归 + 索引入库 + 成员登记)。"""
+        job = Job.build(job_id="ov1",
+                        list_item={"jobName": "岗位ov1", "salaryDesc": "20k", "cityName": "无锡"},
+                        jd_dom={"jd_full": "x"}, company=None, blacklist=set())
+        repo.save_job(job)
+        repo.update_source_link("ov1", link_a)
+        conn = index.connect()
+        try:
+            index.upsert_job(conn, repo.load_job("ov1"), refresh_company=False)
+            conn.commit()
+        finally:
+            conn.close()
+        assert index.upsert_scope_member("ov1", link_a)
+
+    # ---- 数据根 1: 仅口径 A → 出 A 快照作为基线 ----
+    _setup_root(tmp_path / "root1")
+    _sight_via_a()
+    conn = index.connect()
+    try:
+        base = obsnap.capture_snapshot(conn, link_a)
+        conn.commit()
+        base_members = {m["job_id"] for m in obsnap.snapshot_members(conn, base["snapshot_id"])}
+    finally:
+        conn.close()
+    assert base["job_count"] == 1 and base_members == {"ov1"}
+
+    # ---- 数据根 2: 同样 A 入库后, 口径 B sighting 命中同一岗位 ----
+    _setup_root(tmp_path / "root2")
+    _sight_via_a()
+    conn = index.connect()
+    try:
+        n_a_before = conn.execute(
+            "SELECT COUNT(*) FROM scope_members WHERE source_link = ?", (link_a,)
+        ).fetchone()[0]
+        n_b_before = conn.execute(
+            "SELECT COUNT(*) FROM scope_members WHERE source_link = ?", (link_b,)
+        ).fetchone()[0]
+        epoch_a = conn.execute(
+            "SELECT last_epoch_id FROM scope_members"
+            " WHERE source_link = ? AND job_id = 'ov1'", (link_a,)
+        ).fetchone()[0]
+        index.apply_scope(conn, link_a)
+        shadow_a_before = conn.execute("SELECT COUNT(*) FROM temp.jobs").fetchone()[0]
+    finally:
+        conn.close()
+
+    epoch_b = obsnap.active_epoch_id(link_b)
+    assert index.upsert_scope_member("ov1", link_b)
+    assert repo.add_scope_link("ov1", link_b, epoch_b)
+
+    conn = index.connect()
+    try:
+        # ① J 同时是 A、B 成员, 且 A 行纪元未被 B 翻动
+        rows = conn.execute(
+            "SELECT source_link, last_epoch_id FROM scope_members WHERE job_id = 'ov1'"
+        ).fetchall()
+        assert {(r["source_link"], r["last_epoch_id"]) for r in rows} == {
+            (link_a, epoch_a), (link_b, epoch_b)}
+        # ② A 成员数不变, B 成员数 +1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM scope_members WHERE source_link = ?", (link_a,)
+        ).fetchone()[0] == n_a_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM scope_members WHERE source_link = ?", (link_b,)
+        ).fetchone()[0] == n_b_before + 1
+        # ③ A 口径实时影子岗位数不变
+        index.apply_scope(conn, link_a)
+        assert conn.execute("SELECT COUNT(*) FROM temp.jobs").fetchone()[0] == shadow_a_before
+        # ⑤ jobs.source_link 冻结为 A (DB 侧)
+        assert conn.execute(
+            "SELECT source_link FROM jobs WHERE job_id = 'ov1'").fetchone()[0] == link_a
+    finally:
+        conn.close()
+    # ⑤/⑥ 文件侧: 首归冻结 + provenance.scope_links append-only
+    j = repo.load_job("ov1")
+    assert j.source_link == link_a
+    assert j.provenance["source_link"] == link_a
+    assert j.provenance["scope_links"] == [link_a, link_b]
+
+    # ④ B sighting 后 A 快照与基线一致 (job_count + 成员集), B 自己的快照纳入 J
+    conn = index.connect()
+    try:
+        after = obsnap.capture_snapshot(conn, link_a)
+        conn.commit()
+        assert after["job_count"] == base["job_count"]
+        assert {m["job_id"] for m in obsnap.snapshot_members(conn, after["snapshot_id"])} \
+            == base_members
+        shot_b = obsnap.capture_snapshot(conn, link_b)
+        conn.commit()
+        assert shot_b["job_count"] == 1
+    finally:
+        conn.close()

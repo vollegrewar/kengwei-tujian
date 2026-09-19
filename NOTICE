@@ -1,0 +1,13 @@
+Kengwei Tujian (坑位图鉴)
+Copyright (c) 2026 vollegrewar
+
+This project is a derivative work of "get-a-job"
+(https://github.com/helsonxiao/get-a-job), Copyright (c) 2026 helsonxiao,
+licensed under the MIT License (see LICENSE).
+
+The upstream project's full commit history is included, up to upstream
+commit 5bb2e4c (v0.11.0), together with local development by vollegrewar:
+salary-normalization scoring rules, resume content-quality methodology,
+OpenAI-compatible API scoring driver, pool-expansion workflow, and assorted
+scraper / store / CLI fixes. Original authorship and commit history are
+preserved unmodified.

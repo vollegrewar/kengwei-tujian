@@ -7,6 +7,17 @@
 | **AGENT.md**（本文）       | 应用场景与容错机制：9 个使用案例、重试/降级/超时策略、注意事项 | 开发者、想了解系统行为细节的智能体 |
 | **gaj-agent/SKILL.md** | 操作策略：首次配置、每日流程编排、错误处理决策树、超时预算     | 可安装到各智能体的技能包      |
 
+### 文档放哪（红线）
+
+| 位置 | 装什么 | 约定 |
+|---|---|---|
+| **`docs/`** | 工程/设计文档**唯一家**（`adr/` 架构决策、`proposals/` 待决策方案、`archive/YYYY-MM/` 一次性产物） | 写文档一律进这里；命名建议 `YYYY-MM-DD-<类型>-<主题>.md` |
+| **`landing/`** | 公网站点源码（`index.html` + `assets/`），由 GitHub Actions 自动发布到 `gh-pages` | agent **不得**往 landing 或 docs 根塞站点/图片 |
+| **`.trae/specs/`** | Trae 在制工作区 | 仅放进行中的 spec，完成后归 `docs/` |
+| `gaj-agent/` | Skill 包 | 随代码走，不算文档 |
+
+> **不要**把工程文档写到仓库根、`landing/` 或散落目录；`docs/` 不是 GitHub Pages 发布面（发布走 landing → gh-pages）。
+
 命令的参数、返回字段、错误码、退出码等信息已内置于 CLI help text，
 运行 `python3 -m gaj agent -h` 即可查看完整说明，本文不再重复。
 
@@ -228,7 +239,8 @@ python3 -m gaj backfill-list-item --rescore     # 落盘 + 对变更岗位重跑
 | 命令                          | 上界来源                                                            | 量级              |
 | --------------------------- | --------------------------------------------------------------- | --------------- |
 | `status` / `jobs` / `job`   | 纯本地读索引/文件                                                       | 秒级              |
-| `crawl`                     | `--max-pages`（默认无上限，建议按需设置，如：10）+ 连续重复页提前结束；单次 CDP 通信超时 30s，列表 API 每次重试 3 次 | 通常几分钟，最坏约 30 分钟 |
+| `crawl`                     | 阻塞时长与采集量成正比（人工模拟节奏 4-11s/页 + 逐职位抓详情），单口径完整采集常见**数小时**；`--max-pages` 可分块，连续重复页提前结束；单次 CDP 通信超时 30s，列表 API 每次重试 3 次 | **agent 一律用 `--background` + 分块，不要前台等待** |
+| `crawl-status`              | 纯本地读进度文件（`--wait` 例外，等多久由参数定，上限 600s）    | 秒级            |
 | `analyze` / `daily` 的 AI 部分 | 每个职位生成超时 300s（超时即返回，不阻塞）；daily 默认只分析 3 个                        | 每职位 ≤ 5-6 分钟    |
 
 进程被外部强制终止是安全的：数据逐个职位增量落盘，重跑不会重复抓取
@@ -247,15 +259,33 @@ python3 -m gaj backfill-list-item --rescore     # 落盘 + 对变更岗位重跑
 
 ### 退出机制
 
-* 采集：三种提前结束——`covered`（连续 3 页全重复，职位已覆盖）、
+* 采集：四种提前结束——`covered`（连续 3 页全重复，职位已覆盖）、
+  `budget_24h`（近 24h 已抓岗位数达到配额上限）、
   翻页上限 `--max-pages`、API 连续失败；
   原因在 `crawl_stats.early_stop_reason` 里可见。
-  无论何种停止都会记录续翻页码，下次从该页接着翻，不会漏掉更靠后的新职位。
+  无论何种停止都会记录续翻页码（锚点只进不退，不会被浅页失败冲掉），
+  下次从该页接着翻，不会漏掉更靠后的新职位。
 
 * AI：生成超时即止损返回；单个职位失败不中断批量流程。
 
 * `daily`：任何阶段失败都降级为 `warnings` 继续往下走，
   **始终产出** **`digest_markdown`**，不让一次局部失败浪费整个编排。
+
+### 24h 采集配额
+
+采集侧有 **24 小时滚动窗口配额**（`gaj/config.py` 的
+`CrawlConfig.max_jobs_per_24h`，默认 350，0=不限）：近 24h 已抓岗位详情数
+达到上限即提前结束（`early_stop_reason=budget_24h`），配额随窗口滚动自动
+释放，次日可继续采。计数口径为索引中 `first_seen` 落在窗口内的岗位数
+（每个岗位详情抓取时即增量入索引，中途崩溃不丢计数）。
+
+`agent status` 的 `budget_24h: {cap, used, remaining}` 给出当前用量与剩余；
+`crawl` 返回体也带 `budget_24h`。**配额用尽不是故障**——看到
+`budget_24h` 就是正常限流，等窗口滚动后再采即可，不要为此重试或调大上限。
+
+由来：2026-09-19 连续 6.3 小时采了 534 个岗位后，BOSS 返回 `code=32`
+「您的账户存在异常行为，已暂时被禁止使用」并封禁数日；此前无封禁的日子
+单日最多 231 个。故取 350 —— 高于历史安全线、低于封禁点。
 
 ### 采集覆盖策略
 
@@ -273,6 +303,57 @@ python3 -m gaj backfill-list-item --rescore     # 落盘 + 对变更岗位重跑
 `python3 -m gaj scope-urls` 批量生成（见「场景十：口径扩池」），每条 URL 是一个独立
 口径，重复率天然比同一个宽口径低。
 
+### 长采集的后台运行（agent 推荐方式）
+
+`crawl` 阻塞时长与采集量成正比：单口径完整采集（翻到 hasMore=False）常见
+**数小时**，前台跑会占死终端、也超出多数 agent shell 工具的超时预算。
+正确姿势是 **后台运行 + 分块采集 + 有界等待**：
+
+```bash
+# 1. 后台启动（子进程自动 caffeinate 防 macOS 休眠）: 立即返回 pid/日志/进度文件
+python3 -m gaj agent crawl --url "<BOSS列表页URL>" --max-pages 10 --background
+
+# 2. 有界等待: 每次调用最多阻塞 480s，done=true 则结束，否则 timed_out=true
+#    数小时的采集就分次调用 --wait（每次一个 shell 调用），不要高频空转轮询，
+#    也可以不等——先向用户报告"采集中"，之后按需来查
+python3 -m gaj agent crawl-status --wait 480
+
+# 3. done 后读 result_summary（本次 crawl_stats/migrated/scored）；
+#    覆盖了也不怕，last_runs 里保留最近 5 次运行的结果归档
+python3 -m gaj agent crawl-status
+```
+
+**分块采集**：大口径用 `--max-pages 10` 一块一块跑（一块约 40-60 分钟），
+每块结束记录续翻锚点，下一块自动从未覆盖处接续（重复页自动跳过），
+直到 `early_stop_reason=covered`（搜索结果已覆盖）。相比一次跑几小时，
+分块有干净的检查点：随时可停、随时可查、中断只损失当前块。
+
+**多口径串行采集示例**（如无锡 + 苏州对比）：
+
+```bash
+python3 -m gaj agent crawl --url "<无锡列表页URL>" --max-pages 10 --background
+# 分次 crawl-status --wait 480 直到 done，必要时再启动下一块
+python3 -m gaj agent crawl --url "<苏州列表页URL>" --max-pages 10 --background
+# 同上，直到 covered
+# 两个口径都采完后, 分别 report-bundle 固化快照, 再 snapshot diff 对比
+```
+
+机制说明：
+
+* **互斥锁**（`data/crawl.lock`，按 pid 存活判定）：同一时刻只允许一个采集，
+  防止并发多开触发反爬。撞锁报 `crawl_busy`，等待运行中的采集结束即可。
+  崩溃残留的锁会被下次采集自动接管，无需手动清理。
+* **进度心跳**（`data/crawl_progress.json`）：采集过程中逐页/逐职位原子落盘，
+  `status` 命令也附带 `crawl_progress` 概要。`kill -9` 也能被正确识别为
+  running=false（锁按 pid 判活），数据已增量落盘，重跑安全。
+* **结果归档**：每次 done/error 的结果进 `last_runs`（最近 5 次），多口径
+  串行时下一次采集启动不会覆盖上一个口径的最终结果。
+* **分离子进程**：`--background` 用 `start_new_session` 启动，调用方（agent
+  会话/终端）退出不影响采集；子进程 stdout/err 重定向到
+  `logs/crawl-bg-<时间戳>.log`，并套 `caffeinate -is` 阻止 macOS 休眠
+  （数小时采集不加这个，合盖/空闲休眠必中断）。手动前台跑长时间采集时，
+  建议自己包一层 `caffeinate -is python3 -m gaj ...`。
+
 ## 注意事项
 
 * AI 分析依赖**可见的** Chrome（网页版大模型需要登录态，无头模式不行）。
@@ -282,10 +363,20 @@ python3 -m gaj backfill-list-item --rescore     # 落盘 + 对变更岗位重跑
   `AIConfig.tab_mode` 改为 `"background"`（代价是后台节流时靠看门狗救援，
   响应可能更慢）。
 
-* 采集节奏模拟人工浏览，不要为提速改动节奏逻辑或并发多开 crawl。
+* 采集节奏模拟人工浏览，不要为提速改动节奏逻辑或并发多开 crawl
+  （系统已用 `data/crawl.lock` 强制互斥，并发会得到 `crawl_busy`）。
 
 * 数据都在 `data/` 下（已被 gitignore），`data/crawl_state.json` 记录
-  采集覆盖率状态，删除无害。
+  采集覆盖率状态，`crawl_progress.json` / `crawl.lock` 是采集运行时状态
+  （进度心跳 / 互斥锁），都是纯派生数据，删除无害。
+
+* **数据兼容红线**：涉及 `data/` 存量数据结构的不兼容改动，必须同时满足
+  三条 —— ① 老数据在任意入口首次连接/启动时**自动迁移**（幂等，无需手工
+  操作，迁移结果在日志中显式报数）；② 迁移前**自动冷备**一次
+  （参照 `gaj/store/index.py::_cold_backup`，backup API 落
+  `data/backups/`）；③ 在 **CHANGELOG.md** 里写清升级说明与语义变化。
+  用户采集数据来之不易（一轮采集常达数小时），不允许任何要求用户手工
+  迁移、重建或丢弃数据的方案。
 
 * 选择器可能随大模型网站改版失效；`analyze` 连续失败且报"输入框注入失败"
   之类错误时，提示用户检查 `gaj/browser/llm_driver_deepseek.py` 的选择器。

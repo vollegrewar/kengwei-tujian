@@ -14,12 +14,15 @@ boss_scraper 是经过验证的老爬虫, 直接复用它的 CDP 采集能力。
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
 from .. import config as cfg
 from ..logging_setup import get_logger
 from ..store import index, repo
+
+from . import progress
 
 log = get_logger("scraper")
 
@@ -63,6 +66,25 @@ def crawl(
     started = time.time()
     result: dict[str, Any] = {}
     incremental_count = 0
+
+    # ---- 0. 互斥锁: 共享一个 CDP Chrome, 并发多开会触发反爬, 拒绝并发采集 ----
+    busy = progress.acquire_lock(list_url)
+    if busy:
+        log.warning(
+            f"已有采集在运行 (pid={busy.get('pid')}), 本次拒绝启动 (crawl_busy)"
+        )
+        return {"error_code": "crawl_busy", "busy": busy, "elapsed": 0.0}
+
+    progress.write_progress(
+        {
+            "phase": "crawl",
+            "url": list_url,
+            "pid": os.getpid(),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "error": None,
+            "result_summary": None,
+        }
+    )
 
     # ---- 构建最近已采集职位 ID 集合, 翻页时跳过 ----
     if skip_recent_hours is None:
@@ -184,6 +206,39 @@ def crawl(
         # 续翻: 上次因连续重复页停止时的页码, 本次前几页全重复时跳到那里再试
         resume_page = crawl_state.get_last_dup_page(list_url)
 
+        # ---- 24h 滚动窗口配额: 限制单日采集总量, 避免高频采集被反爬封号 ----
+        # 计数口径 = 索引里 first_seen 落在近 24h 的岗位数 (每抓一个岗位详情
+        # 即增量入索引, 中途崩溃也不丢计数), 减去已用即为本次可采配额。
+        budget_cap = cfg.SETTINGS.crawl.max_jobs_per_24h
+        budget_used = 0
+        job_budget = None
+        if budget_cap:
+            try:
+                from datetime import datetime, timedelta
+
+                from ..store import index as _index
+
+                since = (datetime.now() - timedelta(hours=24)).strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+                with _index.session() as conn:
+                    budget_used = _index.count_collected_since(conn, since)
+                job_budget = max(budget_cap - budget_used, 0)
+                log.info(
+                    f"24h 采集配额: 已用 {budget_used}/{budget_cap}, "
+                    f"本次最多再采 {job_budget} 个"
+                )
+            except Exception as exc:
+                log.warning(f"读取 24h 采集配额失败 (本次不限制): {exc}")
+                budget_used, job_budget = 0, None
+
+        def _forward_progress(evt: dict) -> None:
+            """爬虫进度事件 → 进度文件 (phase 固定为 crawl)。"""
+            evt = dict(evt)
+            evt["phase"] = "crawl"
+            evt["pid"] = os.getpid()
+            progress.write_progress(evt)
+
         crawler = JobCrawler(
             cdp_port=port,
             jobs_dir=tmp_dir,
@@ -198,32 +253,40 @@ def crawl(
             slowdown_cap=cfg.SETTINGS.crawl.slowdown_cap,
             resume_page=resume_page,
             start_page=start_page,
+            job_budget=job_budget,
+            on_progress=_forward_progress,
         )
         incremental_ids: set = set()
 
         def _on_page_seen(job_ids: list) -> None:
-            """增量口径重归属: 列表页出现的历史岗位实时计入当前口径。"""
+            """增量成员登记: 列表页出现的历史岗位实时计入当前口径 (只增不减)。"""
             from ..store import index as _index
             from ..store.observatory_snapshot import active_epoch_id
-            from ..store.repo import set_collection_epoch, update_source_link
+            from ..store.repo import add_scope_link, set_collection_epoch
 
             epoch = active_epoch_id(list_url)
             for jid in job_ids:
                 if not jid or jid in incremental_ids:
                     continue
                 try:
-                    if _index.touch_job_source_link(jid, list_url):
-                        update_source_link(jid, list_url)
+                    if _index.upsert_scope_member(jid, list_url):
+                        add_scope_link(jid, list_url, epoch)
                         set_collection_epoch(jid, epoch)
                         incremental_ids.add(jid)
                 except Exception as exc:
-                    log.debug(f"增量口径重归属跳过 {jid}: {exc}")
+                    log.debug(f"成员登记跳过 {jid}: {exc}")
 
         crawler.crawl_from_url(list_url, on_page_seen=_on_page_seen)
         result["crawl_stats"] = crawler.stats.to_dict()
         result["crawl_stats_text"] = str(crawler.stats)
         result["crawl_dir"] = tmp_dir
         result["incremental"] = incremental_count
+        if budget_cap:
+            result["budget_24h"] = {
+                "cap": budget_cap,
+                "used": budget_used,
+                "remaining": max(budget_cap - budget_used - crawler.stats.jobs_scraped, 0),
+            }
         log.info(f"采集完成: {crawler.stats} (增量入库 {incremental_count} 个)")
 
         # 把本次采集链接登记进口径注册表 (已存在则跳过), 让 Web 口径管理 /
@@ -238,9 +301,10 @@ def crawl(
             result["crawl_state"] = crawl_state.record_crawl(
                 list_url, crawler.stats.to_dict()
             )
-            # 续翻页码持久化: 无论因何停止(covered/翻页上限/失败/中断)都记录
-            # 下次从该页接着翻; 真正翻到底(hasMore=False)时 crawler 会把
-            # last_dup_page 重置为 0, 下次从第 1 页重新抓最新。
+            # 续翻页码持久化: 因 covered/翻页上限/失败/中断停止时记录该页,
+            # 下次从该页接着翻; 锚点只进不退(见 JobCrawler._record_resume_anchor),
+            # 真正翻到底(hasMore=False)时 crawler 会把 last_dup_page 重置为 0,
+            # 下次从第 1 页重新抓最新。
             stats_dict = crawler.stats.to_dict()
             if stats_dict.get("last_dup_page_dirty"):
                 crawl_state.save_last_dup_page(
@@ -252,9 +316,20 @@ def crawl(
         log.error(f"采集失败: {exc}")
         result["error"] = f"采集失败: {exc}"
         result["elapsed"] = round(time.time() - started, 1)
+        progress.write_progress({"phase": "error", "error": result["error"]})
+        progress.archive_run(
+            {
+                "url": list_url,
+                "phase": "error",
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "error": result["error"],
+            }
+        )
+        progress.release_lock()
         return result
 
     # ---- 2. 迁移 (migrate 内部会调 reindex) ----
+    progress.write_progress({"phase": "migrate"})
     migrated_reindexed = False
     if auto_migrate:
         try:
@@ -274,7 +349,7 @@ def crawl(
             log.error(f"迁移失败: {exc}")
             result["migrate_error"] = str(exc)
 
-    # ---- 2.5 列表级口径重归属: 本次筛选列表出现过的历史岗位统一挪到当前口径 ----
+    # ---- 2.5 列表级口径成员登记: 本次筛选列表出现过的历史岗位只增登记为当前口径成员 ----
     if auto_migrate:
         try:
             from ..store.migrate import reassign_source_links
@@ -282,14 +357,12 @@ def crawl(
             src_path = Path(result.get("crawl_dir") or "jobs")
             reassigned = reassign_source_links(src_path, list_url)
             result["reassigned"] = reassigned
-            if reassigned.get("reassigned"):
-                # 重归属改了 job.json, 强制重建索引让 source_link 进库
-                migrated_reindexed = False
         except Exception as exc:
-            log.error(f"口径重归属失败: {exc}")
+            log.error(f"口径成员登记失败: {exc}")
             result["reassign_error"] = str(exc)
 
     # ---- 3. 规则打分 ----
+    progress.write_progress({"phase": "score"})
     if auto_score:
         try:
             from ..core.score_runner import score_all
@@ -307,6 +380,7 @@ def crawl(
             result["score_error"] = str(exc)
 
     # ---- 4. 重建索引 (migrate 没做过才做) ----
+    progress.write_progress({"phase": "reindex"})
     if auto_reindex and not migrated_reindexed:
         try:
             idx = index.reindex()
@@ -318,6 +392,26 @@ def crawl(
 
     result["elapsed"] = round(time.time() - started, 1)
     log.info(f"采集全流程完成, 耗时 {result['elapsed']}s")
+    summary = {
+        "crawl_stats": result.get("crawl_stats"),
+        "budget_24h": result.get("budget_24h"),
+        "incremental": result.get("incremental"),
+        "migrated": result.get("migrated"),
+        "reassigned": result.get("reassigned"),
+        "scored": result.get("scored"),
+        "reindexed": result.get("reindexed"),
+        "elapsed": result.get("elapsed"),
+    }
+    progress.write_progress({"phase": "done", "result_summary": summary})
+    progress.archive_run(
+        {
+            "url": list_url,
+            "phase": "done",
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "result_summary": summary,
+        }
+    )
+    progress.release_lock()
     return result
 
 
